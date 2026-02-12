@@ -1,0 +1,70 @@
+import AcpClient, {
+  AcpContractClientV2,
+  type AcpJob,
+  type AcpMemo,
+} from "@virtuals-protocol/acp-node";
+import { createLogger } from "../utils/logger.ts";
+import { handleNewTask } from "./handlers.ts";
+
+const log = createLogger("acp-client");
+
+export async function createHedgeFiClient(): Promise<AcpClient> {
+  const privateKey = process.env.HEDGEFI_PRIVATE_KEY;
+  const entityId = process.env.HEDGEFI_ENTITY_ID;
+  const walletAddress = process.env.HEDGEFI_WALLET_ADDRESS;
+
+  if (!privateKey || !entityId || !walletAddress) {
+    throw new Error(
+      "Missing required env vars: HEDGEFI_PRIVATE_KEY, HEDGEFI_ENTITY_ID, HEDGEFI_WALLET_ADDRESS"
+    );
+  }
+
+  log.info("Building ACP contract client...", {
+    entityId: Number(entityId),
+    walletAddress,
+  });
+
+  // AcpContractClientV2.build(privateKey, entityId, walletAddress, config?)
+  // config defaults to baseAcpConfigV2 (Base mainnet)
+  const contractClient = await AcpContractClientV2.build(
+    privateKey as `0x${string}`,
+    Number(entityId),
+    walletAddress as `0x${string}`
+  );
+
+  log.info("Contract client built successfully");
+
+  const acpClient = new AcpClient({
+    acpContractClient: contractClient,
+    onNewTask: async (job: AcpJob, memoToSign?: AcpMemo) => {
+      log.info(`New task received: job #${job.id}`, {
+        phase: job.phase,
+        name: job.name,
+        clientAddress: job.clientAddress,
+      });
+      try {
+        await handleNewTask(job, memoToSign);
+      } catch (err) {
+        log.error(`Error handling job #${job.id}`, err);
+      }
+    },
+    onEvaluate: async (job: AcpJob) => {
+      log.info(`Evaluation requested for job #${job.id}`, {
+        phase: job.phase,
+      });
+      try {
+        // Auto-approve in sandbox — replace with real verification in production
+        await job.evaluate(true, "HedgeFi: Deliverable verified and approved.");
+        log.info(`Job #${job.id} evaluation approved`);
+      } catch (err) {
+        log.error(`Error evaluating job #${job.id}`, err);
+      }
+    },
+  });
+
+  // Must call init() separately — sets up socket.io connection and event listeners
+  await acpClient.init();
+
+  log.info("HedgeFi ACP client initialized and connected");
+  return acpClient;
+}

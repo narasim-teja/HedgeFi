@@ -1,8 +1,12 @@
 {
   "name": "hedge",
-  "module": "index.ts",
+  "module": "src/index.ts",
   "type": "module",
   "private": true,
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "start:buyer": "bun run scripts/test-buyer.ts"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
