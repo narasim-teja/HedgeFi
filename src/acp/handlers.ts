@@ -3,8 +3,15 @@ import { AcpJobPhases, FareAmount } from "@virtuals-protocol/acp-node";
 import { createLogger } from "../utils/logger.ts";
 import type { JobName } from "../utils/types.ts";
 import { handleHedgeAnalysis } from "./jobs/hedge-analysis.ts";
-import { handleExecuteHedge } from "./jobs/execute-hedge.ts";
-import { handleCloseHedge } from "./jobs/close-hedge.ts";
+import {
+  handleExecuteHedgeAnalysis,
+  handleExecuteHedgeExecution,
+} from "./jobs/execute-hedge.ts";
+import {
+  handleCloseHedgePreview,
+  handleCloseHedgeExecution,
+} from "./jobs/close-hedge.ts";
+import { getJobState } from "../db/job-state.ts";
 import type { ValidationResult } from "./validation.ts";
 import {
   validateHedgeAnalysisReq,
@@ -81,11 +88,11 @@ export async function handleNewTask(
       try {
         if (
           (jobName === "execute_hedge" || jobName === "close_hedge") &&
-          (job as any).netPayableAmount > 0
+          job.netPayableAmount && job.netPayableAmount > 0
         ) {
           const fareAmount = new FareAmount(
-            (job as any).netPayableAmount,
-            (job as any).baseFare
+            job.netPayableAmount,
+            job.baseFare ?? 0
           );
           await job.rejectPayable(`Validation failed: ${validation.error}`, fareAmount);
         } else {
@@ -93,7 +100,6 @@ export async function handleNewTask(
         }
       } catch (rejectErr) {
         log.error(`Job #${job.id}: failed to reject after validation`, rejectErr);
-        // Last resort: deliver error
         await job.deliver(JSON.stringify({ error: validation.error, status: "validation_failed" }));
       }
       return;
@@ -105,12 +111,24 @@ export async function handleNewTask(
       case "hedge_analysis":
         await handleHedgeAnalysis(job);
         break;
-      case "execute_hedge":
-        await handleExecuteHedge(job);
+      case "execute_hedge": {
+        const state = getJobState(String(job.id));
+        if (!state || !state.confirmation_sent) {
+          await handleExecuteHedgeAnalysis(job);
+        } else {
+          await handleExecuteHedgeExecution(job);
+        }
         break;
-      case "close_hedge":
-        await handleCloseHedge(job);
+      }
+      case "close_hedge": {
+        const state = getJobState(String(job.id));
+        if (!state || !state.confirmation_sent) {
+          await handleCloseHedgePreview(job);
+        } else {
+          await handleCloseHedgeExecution(job);
+        }
         break;
+      }
       default:
         log.error(`Job #${job.id}: unhandled job name ${jobName}`);
     }

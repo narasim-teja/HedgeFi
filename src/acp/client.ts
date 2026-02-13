@@ -5,6 +5,7 @@ import AcpClient, {
 } from "@virtuals-protocol/acp-node";
 import { createLogger } from "../utils/logger.ts";
 import { handleNewTask } from "./handlers.ts";
+import { verifyDeliverable } from "./evaluation.ts";
 
 const log = createLogger("acp-client");
 
@@ -54,11 +55,17 @@ export async function createHedgeFiClient(): Promise<AcpClient> {
         phase: job.phase,
       });
       try {
-        // Auto-approve in sandbox — replace with real verification in production
-        await job.evaluate(true, "HedgeFi: Deliverable verified and approved.");
-        log.info(`Job #${job.id} evaluation approved`);
+        const result = await verifyDeliverable(job);
+        await job.evaluate(result.approved, `HedgeFi: ${result.reason}`);
+        log.info(`Job #${job.id} evaluation: ${result.approved ? "approved" : "rejected"} — ${result.reason}`);
       } catch (err) {
         log.error(`Error evaluating job #${job.id}`, err);
+        // Fallback: auto-approve to avoid stuck jobs (positions already exist)
+        try {
+          await job.evaluate(true, "HedgeFi: Auto-approved (evaluation error fallback)");
+        } catch (fallbackErr) {
+          log.error(`Job #${job.id}: fallback evaluation also failed`, fallbackErr);
+        }
       }
     },
   });

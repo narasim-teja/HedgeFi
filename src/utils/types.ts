@@ -64,6 +64,8 @@ export interface HedgePlaced {
   order_id: string;
   tx_hash: string;
   expiry: string;
+  expiry_human?: string;
+  market_slug?: string;
 }
 
 export interface ExecuteHedgeDeliverable {
@@ -74,6 +76,9 @@ export interface ExecuteHedgeDeliverable {
     total_max_coverage: number;
     budget_remaining: number;
     coverage_ratio: string;
+    undeployed_usdc?: number;
+    deployment_ratio?: string;
+    redistribution_rounds?: number;
   };
   reasoning: string;
 }
@@ -295,6 +300,10 @@ export interface PlaceOrderParams {
   usdcAmount: number;
   orderType: LimitlessOrderType;
   venueExchangeAddress: string;
+  /** Required for GTC orders: price per share in USD */
+  pricePerShare?: number;
+  /** Required for GTC orders: market expiration timestamp in ms */
+  expirationTimestamp?: number;
 }
 
 /** Result of a placed order */
@@ -358,3 +367,68 @@ export interface ClosingData {
 // =============================================
 
 export type JobName = "hedge_analysis" | "execute_hedge" | "close_hedge";
+
+// =============================================
+// Job state types (Phase 6.5)
+// =============================================
+
+export interface JobState {
+  job_id: string;
+  job_name: string;
+  phase: JobInternalPhase;
+  confirmation_sent: number; // 0 or 1
+  confirmation_payload: string | null;
+  buyer_address: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export type JobInternalPhase =
+  | "initialized"
+  | "analysis_complete"
+  | "awaiting_confirmation"
+  | "confirmed"
+  | "executing"
+  | "delivered"
+  | "failed";
+
+// =============================================
+// Confirmation flow types (Phase 6.5)
+// =============================================
+
+export interface HedgePlanConfirmation {
+  exposure: PortfolioExposure;
+  recommendations: HedgeRecommendation[];
+  diagnostics_message: string | null;
+  estimated_total_cost: number;
+  estimated_total_coverage: number;
+  coverage_ratio: string;
+  budget: number;
+  risk_tolerance: string;
+  market_details: Array<{
+    market_question: string;
+    action: "BUY_YES" | "BUY_NO";
+    estimated_shares: number;
+    estimated_cost_usd: number;
+    max_payout_usd: number;
+    expiry: string;
+    expiry_human: string;
+    market_slug: string;
+  }>;
+}
+
+export interface ClosePlanConfirmation {
+  positions: Array<{
+    position_id: string;
+    market_title: string;
+    side: string;
+    shares: number;
+    entry_price: number;
+    total_cost_usdc: number;
+    estimated_current_value: number;
+    estimated_pnl: number;
+    expiry: string;
+  }>;
+  total_estimated_return: number;
+  total_estimated_pnl: number;
+}

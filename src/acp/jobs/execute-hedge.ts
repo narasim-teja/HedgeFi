@@ -7,6 +7,7 @@ import type {
   ExecuteHedgeDeliverable,
   HedgePlaced,
   ScoredLimitlessMarket,
+  HedgePlanConfirmation,
 } from "../../utils/types.ts";
 import { LimitlessOrderSide, LimitlessOrderType } from "../../utils/types.ts";
 import { readWalletBalances } from "../../portfolio/reader.ts";
@@ -19,8 +20,20 @@ import { placeHedgeOrder } from "../../limitless/orders.ts";
 import { buildHedgeRecommendations, formatDiagnosticMessage } from "../../hedging/strategy.ts";
 import { validateAndAdjustSizing, formatCoverageRatio } from "../../hedging/sizing.ts";
 import { createPosition, recordOrder } from "../../db/positions.ts";
+import { upsertJobState, setConfirmationSent, setDelivered, setFailed } from "../../db/job-state.ts";
 
 const log = createLogger("execute-hedge");
+
+// =============================================
+// GTC threshold: use GTC for individual orders >= this amount
+// =============================================
+const GTC_ORDER_THRESHOLD_USD = 10;
+const REDISTRIBUTION_THRESHOLD_USD = 0.10;
+const MAX_REDISTRIBUTION_ROUNDS = 2;
+
+// =============================================
+// Helpers
+// =============================================
 
 function parseRequirement(job: AcpJob): ExecuteHedgeRequirement {
   const raw = job.requirement;
@@ -32,17 +45,9 @@ function parseRequirement(job: AcpJob): ExecuteHedgeRequirement {
   };
 
   if (typeof raw === "string") {
-    try {
-      return JSON.parse(raw);
-    } catch {
-      return fallback;
-    }
+    try { return JSON.parse(raw); } catch { return fallback; }
   }
-
-  if (raw && typeof raw === "object") {
-    return raw as ExecuteHedgeRequirement;
-  }
-
+  if (raw && typeof raw === "object") return raw as ExecuteHedgeRequirement;
   return fallback;
 }
 
@@ -63,158 +68,311 @@ function formatExecutionNotification(
     `${hedgesPlaced.length} hedge(s) placed`,
     `Spent: $${formatUsd(summary.total_spent)}`,
     `Max payout: $${formatUsd(summary.total_max_coverage)}`,
+    `Deployed: ${summary.deployment_ratio ?? "N/A"}`,
     `Markets: ${marketNames.join("; ")}`,
   ].join(" | ");
 }
 
-export async function handleExecuteHedge(job: AcpJob): Promise<void> {
-  log.info(`Processing execute_hedge for job #${job.id}`);
+/**
+ * Format a human-readable time-until string from an ISO expiry date.
+ */
+function formatExpiryHuman(expiryIso: string): string {
+  const expiry = new Date(expiryIso);
+  const now = Date.now();
+  const diffMs = expiry.getTime() - now;
+
+  if (diffMs <= 0) return "expired";
+
+  const hours = Math.floor(diffMs / (1000 * 60 * 60));
+  const minutes = Math.floor((diffMs % (1000 * 60 * 60)) / (1000 * 60));
+
+  if (hours >= 48) return `in ${Math.floor(hours / 24)} days`;
+  if (hours >= 1) return `in ${hours}h ${minutes}m`;
+  return `in ${minutes}m`;
+}
+
+/**
+ * Format the hedge plan as a human-readable confirmation message.
+ */
+function formatConfirmationMessage(plan: HedgePlanConfirmation): string {
+  const lines: string[] = [];
+
+  lines.push("HEDGE PLAN FOR REVIEW");
+  lines.push("=====================");
+  lines.push(`Portfolio: $${formatUsd(plan.exposure.total_value_usd)} (${plan.exposure.top_exposure})`);
+  lines.push(`Concentration Risk: ${plan.exposure.concentration_risk}`);
+  lines.push(`Budget: $${formatUsd(plan.budget)} | Risk Tolerance: ${plan.risk_tolerance}`);
+  lines.push("");
+  lines.push("Proposed Orders:");
+
+  for (let i = 0; i < plan.market_details.length; i++) {
+    const detail = plan.market_details[i]!;
+    lines.push(`${i + 1}. "${detail.market_question}" -- ${detail.action}`);
+    lines.push(`   Est. ~${Math.round(detail.estimated_shares)} shares @ $${formatUsd(detail.estimated_cost_usd / Math.max(detail.estimated_shares, 1))}/share = $${formatUsd(detail.estimated_cost_usd)}`);
+    lines.push(`   Max payout: $${formatUsd(detail.max_payout_usd)}`);
+    lines.push(`   Expires: ${new Date(detail.expiry).toUTCString()} (${detail.expiry_human})`);
+  }
+
+  lines.push("");
+  lines.push(`Estimated Total Cost: $${formatUsd(plan.estimated_total_cost)}`);
+  lines.push(`Estimated Max Coverage: $${formatUsd(plan.estimated_total_coverage)} (${plan.coverage_ratio})`);
+  const undeployed = plan.budget - plan.estimated_total_cost;
+  if (undeployed > 0.01) {
+    lines.push(`Estimated Undeployed: ~$${formatUsd(undeployed)}`);
+  }
+
+  if (plan.diagnostics_message) {
+    lines.push("");
+    lines.push(`Note: ${plan.diagnostics_message}`);
+  }
+
+  lines.push("");
+  lines.push("Reply APPROVE to execute these hedges or REJECT to cancel with full refund.");
+
+  return lines.join("\n");
+}
+
+/**
+ * Try to reject with refund; fall back to delivering an error deliverable.
+ */
+async function rejectWithRefund(
+  job: AcpJob,
+  _jlog: ReturnType<ReturnType<typeof createLogger>["withJob"]>,
+  reason: string,
+  budgetUsdc: number
+): Promise<void> {
+  try {
+    const payable = job.netPayableAmount;
+    if (payable && payable > 0) {
+      const fareAmount = new FareAmount(payable, job.baseFare);
+      await job.rejectPayable(reason, fareAmount);
+      try { await job.createNotification(reason); } catch { /* non-fatal */ }
+      return;
+    }
+  } catch { /* fall through */ }
+  const deliverable: ExecuteHedgeDeliverable = {
+    exposure: { total_value_usd: 0, tokens: [], concentration_risk: "low", top_exposure: "Error" },
+    hedges_placed: [],
+    summary: { total_spent: 0, total_max_coverage: 0, budget_remaining: budgetUsdc, coverage_ratio: reason },
+    reasoning: reason,
+  };
+  await job.deliver(JSON.stringify(deliverable));
+}
+
+// =============================================
+// Phase A: Analyze wallet and propose hedge plan
+// =============================================
+
+export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<void> {
+  const jlog = log.withJob(job.id);
+  jlog.info("Phase A: Analyzing wallet for hedge plan");
 
   const req = parseRequirement(job);
-  log.info("Requirement parsed", req);
+  jlog.info("Requirement parsed", req);
+
+  // Track job state
+  upsertJobState(String(job.id), {
+    jobName: "execute_hedge",
+    phase: "initialized",
+    buyerAddress: job.clientAddress,
+  });
 
   try {
     // Step 1: Read real wallet exposure
-    const tWallet = log.time("Read wallet balances");
+    const tWallet = jlog.time("Read wallet balances");
     const rawBalances = await readWalletBalances(req.wallet_address, req.chain);
     const coingeckoIds = rawBalances.map((b) => b.coingeckoId);
     const prices = await getTokenPrices(coingeckoIds);
     const exposure = analyzeExposure(rawBalances, prices);
     tWallet.end();
 
-    // Edge case: stablecoin-only portfolio — reject with refund
+    // Edge case: stablecoin-only portfolio — reject immediately (no confirmation needed)
     if (isStablecoinOnly(exposure)) {
-      log.info("Portfolio is stablecoin-only, rejecting execute_hedge");
-      const reasoning = generateEdgeCaseMessage("stablecoins_only", {
-        totalValue: exposure.total_value_usd,
-      });
-      try {
-        const payable = (job as any).netPayableAmount;
-        if (payable && payable > 0) {
-          const fareAmount = new FareAmount(payable, (job as any).baseFare);
-          await job.rejectPayable(reasoning, fareAmount);
-          try { await job.createNotification("Portfolio is 100% stablecoins — no hedge needed. Refund issued."); } catch { /* non-fatal */ }
-          return;
-        }
-      } catch { /* fall through */ }
-      // If rejectPayable not available, deliver with reasoning
-      const deliverable: ExecuteHedgeDeliverable = {
-        exposure,
-        hedges_placed: [],
-        summary: { total_spent: 0, total_max_coverage: 0, budget_remaining: req.hedge_budget_usdc, coverage_ratio: "No hedge needed — 100% stablecoins." },
-        reasoning,
-      };
-      await job.deliver(JSON.stringify(deliverable));
+      jlog.info("Portfolio is stablecoin-only, rejecting");
+      setFailed(String(job.id));
+      const reasoning = generateEdgeCaseMessage("stablecoins_only", { totalValue: exposure.total_value_usd });
+      await rejectWithRefund(job, jlog, reasoning, req.hedge_budget_usdc);
       return;
     }
 
     // Step 2: Scan Limitless markets + build strategy
-    const tMarkets = log.time("Limitless market scan");
+    const tMarkets = jlog.time("Limitless market scan");
     let scoredMarkets: ScoredLimitlessMarket[] = [];
     try {
       scoredMarkets = await findHedgingMarkets(exposure);
     } catch (err) {
-      log.warn("Failed to fetch Limitless markets", err);
+      jlog.warn("Failed to fetch Limitless markets", err);
     }
     tMarkets.end();
 
-    // Edge case: no markets found — reject with refund
+    // Edge case: no markets — reject immediately
     if (scoredMarkets.length === 0) {
+      jlog.info("No hedging markets found, rejecting");
+      setFailed(String(job.id));
       const topNonStable = exposure.tokens.find((t) => !STABLECOIN_SYMBOLS.has(t.symbol));
-      const reasoning = generateEdgeCaseMessage("no_markets_found", {
-        topAsset: topNonStable?.symbol ?? "your holdings",
-      });
-      try {
-        const payable = (job as any).netPayableAmount;
-        if (payable && payable > 0) {
-          const fareAmount = new FareAmount(payable, (job as any).baseFare);
-          await job.rejectPayable(reasoning, fareAmount);
-          try { await job.createNotification("No prediction markets available — refund issued."); } catch { /* non-fatal */ }
-          return;
-        }
-      } catch { /* fall through */ }
-      const deliverable: ExecuteHedgeDeliverable = {
-        exposure,
-        hedges_placed: [],
-        summary: { total_spent: 0, total_max_coverage: 0, budget_remaining: req.hedge_budget_usdc, coverage_ratio: "No markets available for hedging." },
-        reasoning,
-      };
-      await job.deliver(JSON.stringify(deliverable));
+      const reasoning = generateEdgeCaseMessage("no_markets_found", { topAsset: topNonStable?.symbol ?? "your holdings" });
+      await rejectWithRefund(job, jlog, reasoning, req.hedge_budget_usdc);
       return;
     }
 
     const { recommendations: rawRecommendations, diagnostics } = buildHedgeRecommendations(
-      exposure,
-      scoredMarkets,
-      req.risk_tolerance,
-      req.hedge_budget_usdc,
-      prices
+      exposure, scoredMarkets, req.risk_tolerance, req.hedge_budget_usdc, prices
     );
 
-    const { adjusted: recommendations, summary } = validateAndAdjustSizing(
+    const { adjusted: recommendations, summary: sizingSummary } = validateAndAdjustSizing(
       rawRecommendations,
-      {
-        hedgeBudget: req.hedge_budget_usdc,
-        riskTolerance: req.risk_tolerance,
-        portfolioValueUsd: exposure.total_value_usd,
-      }
+      { hedgeBudget: req.hedge_budget_usdc, riskTolerance: req.risk_tolerance, portfolioValueUsd: exposure.total_value_usd }
     );
 
-    // Step 3: Place REAL orders on Limitless Exchange
-    const tOrders = log.time("Place hedge orders");
+    if (recommendations.length === 0) {
+      jlog.info("No viable recommendations after sizing, rejecting");
+      setFailed(String(job.id));
+      await rejectWithRefund(job, jlog, "No viable hedge positions could be constructed within your budget and risk parameters.", req.hedge_budget_usdc);
+      return;
+    }
+
+    // Build the confirmation plan
+    const diagMsg = formatDiagnosticMessage(diagnostics);
+    const coverageRatio = formatCoverageRatio(sizingSummary, exposure.total_value_usd, req.risk_tolerance);
+
+    const marketDetails = recommendations.map((rec) => {
+      const market = scoredMarkets.find(
+        (m) => m.slug === String(rec.market_id) || String(m.raw.id) === String(rec.market_id)
+      );
+      return {
+        market_question: rec.market_question,
+        action: rec.action,
+        estimated_shares: rec.shares,
+        estimated_cost_usd: rec.estimated_cost_usd,
+        max_payout_usd: rec.coverage_usd,
+        expiry: rec.expiry,
+        expiry_human: formatExpiryHuman(rec.expiry),
+        market_slug: market?.slug ?? String(rec.market_id),
+      };
+    });
+
+    const plan: HedgePlanConfirmation = {
+      exposure,
+      recommendations,
+      diagnostics_message: diagMsg,
+      estimated_total_cost: recommendations.reduce((s, r) => s + r.estimated_cost_usd, 0),
+      estimated_total_coverage: recommendations.reduce((s, r) => s + r.coverage_usd, 0),
+      coverage_ratio: coverageRatio,
+      budget: req.hedge_budget_usdc,
+      risk_tolerance: req.risk_tolerance,
+      market_details: marketDetails,
+    };
+
+    // Store the frozen plan for execution after confirmation
+    setConfirmationSent(String(job.id), JSON.stringify(plan));
+
+    // Send the plan to the buyer for review
+    const confirmationMsg = formatConfirmationMessage(plan);
+    await job.createRequirement(confirmationMsg);
+    jlog.info("Hedge plan sent to buyer for confirmation");
+
+  } catch (err) {
+    jlog.error("Failed during hedge analysis phase", err);
+    setFailed(String(job.id));
+    await rejectWithRefund(
+      job, jlog,
+      `Hedge analysis failed: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
+      req.hedge_budget_usdc
+    );
+  }
+}
+
+// =============================================
+// Phase B: Execute confirmed hedge plan
+// =============================================
+
+export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
+  const jlog = log.withJob(job.id);
+  jlog.info("Phase B: Executing confirmed hedge plan");
+
+  const req = parseRequirement(job);
+
+  // Retrieve the frozen plan from job state
+  const { getJobState } = await import("../../db/job-state.ts");
+  const state = getJobState(String(job.id));
+  if (!state?.confirmation_payload) {
+    jlog.error("No confirmation payload found for confirmed job");
+    await rejectWithRefund(job, jlog, "Internal error: hedge plan not found. Please retry.", req.hedge_budget_usdc);
+    return;
+  }
+
+  let plan: HedgePlanConfirmation;
+  try {
+    plan = JSON.parse(state.confirmation_payload);
+  } catch {
+    jlog.error("Failed to parse stored confirmation payload");
+    await rejectWithRefund(job, jlog, "Internal error: corrupted hedge plan. Please retry.", req.hedge_budget_usdc);
+    return;
+  }
+
+  upsertJobState(String(job.id), { jobName: "execute_hedge", phase: "executing" });
+
+  try {
+    const { exposure, recommendations } = plan;
+
+    // Re-fetch scored markets for venue/token data (needed for order placement)
+    // The recommendations are frozen but we need live venue addresses
+    const tOrders = jlog.time("Place hedge orders");
     const hedges_placed: HedgePlaced[] = [];
     let totalSpent = 0;
+    let redistributionRounds = 0;
 
+    // Collect successful market slugs for redistribution
+    const successfulSlugs: string[] = [];
+
+    // First pass: execute all recommended orders
     for (const rec of recommendations) {
       if (totalSpent >= req.hedge_budget_usdc) break;
 
       try {
-        // Find the scored market to get slug, tokens, venue
-        const market = scoredMarkets.find(
-          (m) => m.slug === String(rec.market_id) || String(m.raw.id) === String(rec.market_id)
-        );
+        const detail = plan.market_details.find((d) => d.market_slug === rec.market_id || d.market_question === rec.market_question);
+        let marketSlug = detail?.market_slug ?? String(rec.market_id);
 
-        // Get market details — need venue.exchange for EIP-712 signing
-        let marketSlug = market?.slug ?? String(rec.market_id);
-        let venueExchange = market?.raw.venue?.exchange;
-        let tokensYes = market?.raw.tokens.yes;
-        let tokensNo = market?.raw.tokens.no;
-
-        if (!venueExchange) {
-          log.info(`Fetching full market details for ${marketSlug}`);
-          const fullMarket = await fetchMarketBySlug(marketSlug);
-          venueExchange = fullMarket.venue?.exchange;
-          tokensYes = fullMarket.tokens.yes;
-          tokensNo = fullMarket.tokens.no;
-        }
+        // Fetch market details for venue exchange address
+        jlog.info(`Fetching market details for ${marketSlug}`);
+        const fullMarket = await fetchMarketBySlug(marketSlug);
+        const venueExchange = fullMarket.venue?.exchange;
+        const tokensYes = fullMarket.tokens.yes;
+        const tokensNo = fullMarket.tokens.no;
 
         if (!venueExchange) {
-          log.warn(`No venue exchange address for market ${marketSlug}, skipping`);
+          jlog.warn(`No venue exchange address for market ${marketSlug}, skipping`);
           continue;
         }
 
-        // Determine tokenId based on hedge action
         const tokenId = rec.action === "BUY_YES" ? tokensYes : tokensNo;
         if (!tokenId) {
-          log.warn(`No token ID for ${rec.action} on market ${marketSlug}, skipping`);
+          jlog.warn(`No token ID for ${rec.action} on market ${marketSlug}, skipping`);
           continue;
         }
 
         const remainingBudget = req.hedge_budget_usdc - totalSpent;
         const orderAmount = Math.min(rec.estimated_cost_usd, remainingBudget);
 
-        // Place the order on Limitless
+        // Determine order type: GTC for larger orders with expiration data
+        const expirationTimestamp = fullMarket.expirationTimestamp;
+        const useGtc = orderAmount >= GTC_ORDER_THRESHOLD_USD && expirationTimestamp > Date.now();
+        const hedgePrice = rec.action === "BUY_YES"
+          ? (fullMarket.prices?.[0] ?? 0)
+          : (fullMarket.prices?.[1] ?? 0);
+
         const result = await placeHedgeOrder({
           marketSlug,
           tokenId,
           side: LimitlessOrderSide.BUY,
           usdcAmount: orderAmount,
-          orderType: LimitlessOrderType.FOK,
+          orderType: useGtc ? LimitlessOrderType.GTC : LimitlessOrderType.FOK,
           venueExchangeAddress: venueExchange,
+          ...(useGtc ? { pricePerShare: hedgePrice, expirationTimestamp } : {}),
         });
 
         // Record in database
-        const buyerAddress = (job as any).clientAddress ?? "unknown";
+        const buyerAddress = job.clientAddress ?? "unknown";
         const positionId = createPosition({
           jobId: String(job.id),
           buyerAddress,
@@ -251,49 +409,136 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
           shares_bought: result.filledSize,
           price_per_share: result.avgPrice,
           total_cost_usd: result.totalCost,
-          max_payout_usd: result.filledSize / 1e6, // Each share pays $1; filledSize is raw 6-decimal
+          max_payout_usd: result.filledSize / 1e6,
           order_id: result.orderId,
           tx_hash: `limitless:${result.orderId}`,
           expiry: rec.expiry,
+          expiry_human: formatExpiryHuman(rec.expiry),
+          market_slug: marketSlug,
         });
 
         totalSpent += result.totalCost;
-        log.info(`Hedge placed for ${marketSlug}`, {
+        successfulSlugs.push(marketSlug);
+        jlog.info(`Hedge placed for ${marketSlug}`, {
           orderId: result.orderId,
           filledSize: result.filledSize,
           cost: result.totalCost,
+          orderType: useGtc ? "GTC" : "FOK",
         });
       } catch (err) {
-        log.error(`Failed to place order for market ${rec.market_id}`, err);
-        // Continue to next recommendation — don't fail the entire job
+        jlog.error(`Failed to place order for market ${rec.market_id}`, err);
       }
     }
+
+    // Budget redistribution: retry remaining budget on successful markets
+    while (
+      redistributionRounds < MAX_REDISTRIBUTION_ROUNDS &&
+      (req.hedge_budget_usdc - totalSpent) > REDISTRIBUTION_THRESHOLD_USD &&
+      successfulSlugs.length > 0
+    ) {
+      redistributionRounds++;
+      const remaining = req.hedge_budget_usdc - totalSpent;
+      jlog.info(`Redistribution round ${redistributionRounds}: $${remaining.toFixed(2)} remaining`);
+
+      // Retry on the first successful market (most likely to accept more)
+      const retrySlug = successfulSlugs[0]!;
+      try {
+        const fullMarket = await fetchMarketBySlug(retrySlug);
+        const venueExchange = fullMarket.venue?.exchange;
+        if (!venueExchange) break;
+
+        // Find the matching recommendation for token selection
+        const matchingRec = recommendations.find((r) => {
+          const detail = plan.market_details.find((d) => d.market_slug === retrySlug);
+          return detail?.market_question === r.market_question;
+        });
+        if (!matchingRec) break;
+
+        const tokenId = matchingRec.action === "BUY_YES" ? fullMarket.tokens.yes : fullMarket.tokens.no;
+        if (!tokenId) break;
+
+        const result = await placeHedgeOrder({
+          marketSlug: retrySlug,
+          tokenId,
+          side: LimitlessOrderSide.BUY,
+          usdcAmount: remaining,
+          orderType: LimitlessOrderType.FOK,
+          venueExchangeAddress: venueExchange,
+        });
+
+        if (result.totalCost > 0) {
+          const buyerAddress = job.clientAddress ?? "unknown";
+          const positionId = createPosition({
+            jobId: String(job.id),
+            buyerAddress,
+            marketSlug: retrySlug,
+            marketTitle: matchingRec.market_question,
+            tokenId,
+            side: matchingRec.action === "BUY_YES" ? "YES" : "NO",
+            action: matchingRec.action,
+            shares: result.filledSize,
+            entryPrice: result.avgPrice,
+            totalCostUsdc: result.totalCost,
+            orderId: result.orderId,
+            expiry: matchingRec.expiry,
+            venueExchange,
+          });
+
+          recordOrder({
+            positionId,
+            orderType: "open",
+            marketSlug: retrySlug,
+            side: LimitlessOrderSide.BUY,
+            makerAmount: String(Math.ceil(remaining * 1e6)),
+            takerAmount: "1",
+            price: result.avgPrice,
+            filledSize: result.filledSize,
+            orderId: result.orderId,
+            status: result.matched ? "filled" : "placed",
+          });
+
+          hedges_placed.push({
+            market_id: matchingRec.market_id,
+            market_question: matchingRec.market_question,
+            action: matchingRec.action,
+            shares_bought: result.filledSize,
+            price_per_share: result.avgPrice,
+            total_cost_usd: result.totalCost,
+            max_payout_usd: result.filledSize / 1e6,
+            order_id: result.orderId,
+            tx_hash: `limitless:${result.orderId}`,
+            expiry: matchingRec.expiry,
+            expiry_human: formatExpiryHuman(matchingRec.expiry),
+            market_slug: retrySlug,
+          });
+
+          totalSpent += result.totalCost;
+          jlog.info(`Redistribution fill on ${retrySlug}`, { cost: result.totalCost, remaining: req.hedge_budget_usdc - totalSpent });
+        } else {
+          break; // No fill, stop redistributing
+        }
+      } catch (err) {
+        jlog.warn(`Redistribution order failed on ${retrySlug}`, err);
+        break;
+      }
+    }
+
     tOrders.end();
 
-    // If all orders failed but we had recommendations, refund the budget
+    // If all orders failed but we had recommendations, refund
     if (hedges_placed.length === 0 && recommendations.length > 0) {
-      log.warn(`Job #${job.id}: all ${recommendations.length} orders failed to fill`);
-      try {
-        const payable = (job as any).netPayableAmount;
-        if (payable && payable > 0) {
-          const fareAmount = new FareAmount(payable, (job as any).baseFare);
-          await job.rejectPayable(
-            "All hedge orders failed to execute on Limitless Exchange. No positions were opened. Full refund issued.",
-            fareAmount
-          );
-          try {
-            await job.createNotification("Hedge execution failed: no orders could be filled on Limitless Exchange. Refund issued.");
-          } catch { /* non-fatal */ }
-          return;
-        }
-      } catch (refundErr) {
-        log.error(`Job #${job.id}: failed to refund after all orders failed`, refundErr);
-        // Fall through to deliver a zero-result deliverable
-      }
+      jlog.warn(`All ${recommendations.length} orders failed to fill`);
+      setFailed(String(job.id));
+      await rejectWithRefund(
+        job, jlog,
+        "All hedge orders failed to execute on Limitless Exchange. No positions were opened. Full refund issued.",
+        req.hedge_budget_usdc
+      );
+      return;
     }
 
-    // Step 4: Generate POST-EXECUTION reasoning with actual fill data
-    const tReasoning = log.time("AI reasoning generation");
+    // Generate POST-EXECUTION reasoning
+    const tReasoning = jlog.time("AI reasoning generation");
     let reasoning: string;
     if (hedges_placed.length > 0) {
       reasoning = await generateScenarioReasoning({
@@ -315,17 +560,15 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
     }
     tReasoning.end();
 
-    // Append diagnostic warnings if any
-    const diagMsg = formatDiagnosticMessage(diagnostics);
-    if (diagMsg) {
-      reasoning += `\n\nNote: ${diagMsg}`;
+    if (plan.diagnostics_message) {
+      reasoning += `\n\nNote: ${plan.diagnostics_message}`;
     }
 
-    const coverageRatio = formatCoverageRatio(
-      summary,
-      exposure.total_value_usd,
-      req.risk_tolerance
-    );
+    // Budget accountability
+    const undeployedUsdc = Math.round((req.hedge_budget_usdc - totalSpent) * 100) / 100;
+    const deploymentPct = req.hedge_budget_usdc > 0
+      ? Math.round((totalSpent / req.hedge_budget_usdc) * 1000) / 10
+      : 0;
 
     const deliverable: ExecuteHedgeDeliverable = {
       exposure,
@@ -333,56 +576,58 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
       summary: {
         total_spent: Math.round(totalSpent * 100) / 100,
         total_max_coverage: hedges_placed.reduce((s, h) => s + h.max_payout_usd, 0),
-        budget_remaining: Math.round((req.hedge_budget_usdc - totalSpent) * 100) / 100,
-        coverage_ratio: coverageRatio,
+        budget_remaining: undeployedUsdc,
+        coverage_ratio: plan.coverage_ratio,
+        undeployed_usdc: undeployedUsdc,
+        deployment_ratio: `${deploymentPct}% of budget deployed`,
+        redistribution_rounds: redistributionRounds,
       },
       reasoning,
     };
 
-    log.info(`Delivering execute_hedge for job #${job.id}`);
+    jlog.info("Delivering execute_hedge result");
     await job.deliver(JSON.stringify(deliverable));
-    log.info(`Job #${job.id} delivered successfully`);
+    setDelivered(String(job.id));
+    jlog.info("Delivered successfully");
 
-    // Notification memo (mandatory for ACP graduation)
+    // Notification memo
     try {
       const notifMsg = formatExecutionNotification(hedges_placed, deliverable.summary);
       await job.createNotification(notifMsg);
-      log.info(`Job #${job.id}: notification memo sent`);
+      jlog.info("Notification memo sent");
     } catch (notifErr) {
-      log.warn(`Job #${job.id}: failed to send notification memo`, notifErr);
+      jlog.warn("Failed to send notification memo", notifErr);
     }
   } catch (err) {
-    log.error(`Failed to process execute_hedge for job #${job.id}`, err);
+    jlog.error("Failed during hedge execution phase", err);
+    setFailed(String(job.id));
 
-    // Attempt refund via rejectPayable for catastrophic failures
     try {
-      const payable = (job as any).netPayableAmount;
+      const payable = job.netPayableAmount;
       if (payable && payable > 0) {
-        const fareAmount = new FareAmount(payable, (job as any).baseFare);
+        const fareAmount = new FareAmount(payable, job.baseFare);
         await job.rejectPayable(
           `Hedge execution failed: ${err instanceof Error ? err.message : "Unknown error"}`,
           fareAmount
         );
-        log.info(`Job #${job.id}: refund issued via rejectPayable`);
+        jlog.info("Refund issued via rejectPayable");
       } else {
-        // No payable amount — deliver error deliverable instead
         const errorDeliverable: ExecuteHedgeDeliverable = {
           exposure: { total_value_usd: 0, tokens: [], concentration_risk: "low", top_exposure: "Error reading portfolio" },
           hedges_placed: [],
-          summary: { total_spent: 0, total_max_coverage: 0, budget_remaining: req.hedge_budget_usdc, coverage_ratio: "Error: could not analyze portfolio" },
+          summary: { total_spent: 0, total_max_coverage: 0, budget_remaining: req.hedge_budget_usdc, coverage_ratio: "Error: execution failed" },
           reasoning: `Failed to execute hedge: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
         };
         await job.deliver(JSON.stringify(errorDeliverable));
       }
     } catch (rejectErr) {
-      log.error(`Job #${job.id}: failed to reject/deliver error`, rejectErr);
-      // Last resort: deliver error deliverable
+      jlog.error("Failed to reject/deliver error", rejectErr);
       try {
         const errorDeliverable: ExecuteHedgeDeliverable = {
-          exposure: { total_value_usd: 0, tokens: [], concentration_risk: "low", top_exposure: "Error reading portfolio" },
+          exposure: { total_value_usd: 0, tokens: [], concentration_risk: "low", top_exposure: "Error" },
           hedges_placed: [],
-          summary: { total_spent: 0, total_max_coverage: 0, budget_remaining: req.hedge_budget_usdc, coverage_ratio: "Error: could not analyze portfolio" },
-          reasoning: `Failed to execute hedge: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
+          summary: { total_spent: 0, total_max_coverage: 0, budget_remaining: req.hedge_budget_usdc, coverage_ratio: "Error" },
+          reasoning: `Failed to execute hedge: ${err instanceof Error ? err.message : "Unknown error"}.`,
         };
         await job.deliver(JSON.stringify(errorDeliverable));
       } catch { /* truly fatal */ }

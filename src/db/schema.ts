@@ -50,6 +50,19 @@ db.run(`
   )
 `);
 
+db.run(`
+  CREATE TABLE IF NOT EXISTS job_state (
+    job_id TEXT PRIMARY KEY,
+    job_name TEXT NOT NULL,
+    phase TEXT NOT NULL DEFAULT 'initialized',
+    confirmation_sent INTEGER NOT NULL DEFAULT 0,
+    confirmation_payload TEXT,
+    buyer_address TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  )
+`);
+
 log.info("Database schema initialized");
 
 export { db };

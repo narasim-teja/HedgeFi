@@ -1,7 +1,9 @@
 import { createLogger } from "./utils/logger.ts";
+import { validateEnvironment } from "./utils/env-validator.ts";
 import { createHedgeFiClient } from "./acp/client.ts";
 import { authenticateAgent } from "./limitless/auth.ts";
 import { startResourceServer } from "./resources/server.ts";
+import { cleanupOldJobs } from "./db/job-state.ts";
 // Importing schema initializes the SQLite database on startup
 import "./db/schema.ts";
 
@@ -9,6 +11,10 @@ const log = createLogger("main");
 
 async function main() {
   log.info("=== HedgeFi Agent Starting ===");
+
+  // Validate environment variables immediately at startup
+  validateEnvironment();
+  log.info("Environment validation passed");
 
   try {
     // Authenticate with Limitless Exchange (auto-creates account on first login)
@@ -25,13 +31,21 @@ async function main() {
     // Start the ACP Resource HTTP server (positions, markets)
     startResourceServer();
 
+    // Periodic cleanup of old job state records (every 24h)
+    const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+    setInterval(() => {
+      try {
+        cleanupOldJobs(30);
+      } catch (err) {
+        log.warn("Job state cleanup failed", err);
+      }
+    }, CLEANUP_INTERVAL_MS);
+    // Run once at startup too
+    cleanupOldJobs(30);
+
     log.info("HedgeFi agent is live and listening for jobs");
     log.info(`Agent wallet: ${acpClient.walletAddress}`);
     log.info("Press Ctrl+C to stop");
-
-    // SDK's init() registers SIGINT/SIGTERM handlers that disconnect
-    // the socket and call process.exit(0). The process stays alive
-    // via the socket.io connection + Bun.serve().
   } catch (err) {
     log.error("Failed to start HedgeFi agent", err);
     process.exit(1);

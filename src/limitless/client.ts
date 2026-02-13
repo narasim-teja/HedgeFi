@@ -14,8 +14,12 @@ import type {
   PortfolioPositionsResponse,
 } from "../utils/types.ts";
 import { getSessionCookie, ensureAuthenticated } from "./auth.ts";
+import { RateLimiter } from "../utils/rate-limiter.ts";
 
 const log = createLogger("limitless-client");
+
+// Rate limiter: ~5 requests/sec to avoid 429s from Limitless API
+const rateLimiter = new RateLimiter(5, 5);
 
 // =============================================
 // Cache
@@ -41,6 +45,7 @@ async function limitlessFetch<T>(
   path: string,
   params?: Record<string, string | number>
 ): Promise<T> {
+  await rateLimiter.acquire();
   const url = new URL(`${LIMITLESS_API_BASE_URL}${path}`);
   if (params) {
     for (const [key, value] of Object.entries(params)) {
@@ -187,6 +192,7 @@ async function limitlessAuthFetch<T>(
   path: string,
   options?: { method?: string; body?: string; params?: Record<string, string | number> }
 ): Promise<T> {
+  await rateLimiter.acquire();
   await ensureAuthenticated();
 
   const url = new URL(`${LIMITLESS_API_BASE_URL}${path}`);

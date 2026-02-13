@@ -23,6 +23,7 @@ import type {
 import { submitOrder } from "./client.ts";
 import { getUserProfile, ensureAuthenticated } from "./auth.ts";
 import { ensureUsdcApproval } from "./approvals.ts";
+import { withRetry } from "../utils/retry.ts";
 
 const log = createLogger("limitless-orders");
 
@@ -99,6 +100,78 @@ function buildFokSellOrder(
     makerAmount,
     takerAmount: 1n, // FOK marker
     expiration: 0n,
+    nonce: 0n,
+    feeRateBps: BigInt(feeRateBps),
+    side: LimitlessOrderSide.SELL,
+    signatureType: LimitlessSignatureType.EOA,
+  };
+}
+
+// =============================================
+// GTC order building (Phase 6.5)
+// =============================================
+
+/**
+ * Build an unsigned GTC BUY order.
+ * GTC: makerAmount = USDC to spend (6 decimals), takerAmount = shares to receive (6 decimals)
+ * Expiration = market expiry - 60 seconds
+ */
+function buildGtcBuyOrder(
+  tokenId: string,
+  usdcAmount: number,
+  pricePerShare: number,
+  expirationTimestamp: number,
+  feeRateBps: number
+): UnsignedOrder {
+  const account = getAccount();
+  const makerAmount = BigInt(Math.ceil(usdcAmount * 10 ** USDC_DECIMALS));
+  const shares = usdcAmount / pricePerShare;
+  const takerAmount = BigInt(Math.ceil(shares * 10 ** USDC_DECIMALS));
+  // Expire 60 seconds before market closes (in seconds, not ms)
+  const expiration = BigInt(Math.floor((expirationTimestamp - 60000) / 1000));
+
+  return {
+    salt: generateSalt(),
+    maker: account.address,
+    signer: account.address,
+    taker: ZERO_ADDRESS,
+    tokenId,
+    makerAmount,
+    takerAmount,
+    expiration,
+    nonce: 0n,
+    feeRateBps: BigInt(feeRateBps),
+    side: LimitlessOrderSide.BUY,
+    signatureType: LimitlessSignatureType.EOA,
+  };
+}
+
+/**
+ * Build an unsigned GTC SELL order.
+ * GTC SELL: makerAmount = shares to sell (6 decimals), takerAmount = USDC to receive (6 decimals)
+ */
+function buildGtcSellOrder(
+  tokenId: string,
+  shares: number,
+  pricePerShare: number,
+  expirationTimestamp: number,
+  feeRateBps: number
+): UnsignedOrder {
+  const account = getAccount();
+  const makerAmount = BigInt(Math.ceil(shares * 10 ** USDC_DECIMALS));
+  const usdcToReceive = shares * pricePerShare;
+  const takerAmount = BigInt(Math.ceil(usdcToReceive * 10 ** USDC_DECIMALS));
+  const expiration = BigInt(Math.floor((expirationTimestamp - 60000) / 1000));
+
+  return {
+    salt: generateSalt(),
+    maker: account.address,
+    signer: account.address,
+    taker: ZERO_ADDRESS,
+    tokenId,
+    makerAmount,
+    takerAmount,
+    expiration,
     nonce: 0n,
     feeRateBps: BigInt(feeRateBps),
     side: LimitlessOrderSide.SELL,
@@ -205,19 +278,30 @@ export async function placeHedgeOrder(params: PlaceOrderParams): Promise<PlaceOr
   const ownerId = profile?.id ?? 0;
   const feeRateBps = profile?.rank?.feeRateBps ?? DEFAULT_FEE_RATE_BPS;
 
-  // 4. Build order
+  // 4. Build order (FOK or GTC)
   let order: UnsignedOrder;
-  if (side === LimitlessOrderSide.BUY) {
-    order = buildFokBuyOrder(tokenId, usdcAmount, feeRateBps);
+  if (orderType === LimitlessOrderType.GTC) {
+    if (!params.pricePerShare || !params.expirationTimestamp) {
+      throw new Error("GTC orders require pricePerShare and expirationTimestamp");
+    }
+    if (side === LimitlessOrderSide.BUY) {
+      order = buildGtcBuyOrder(tokenId, usdcAmount, params.pricePerShare, params.expirationTimestamp, feeRateBps);
+    } else {
+      order = buildGtcSellOrder(tokenId, usdcAmount, params.pricePerShare, params.expirationTimestamp, feeRateBps);
+    }
   } else {
-    order = buildFokSellOrder(tokenId, usdcAmount, feeRateBps);
+    if (side === LimitlessOrderSide.BUY) {
+      order = buildFokBuyOrder(tokenId, usdcAmount, feeRateBps);
+    } else {
+      order = buildFokSellOrder(tokenId, usdcAmount, feeRateBps);
+    }
   }
 
   // 5. Sign order
   const signature = await signOrder(order, venueExchangeAddress);
   log.debug("Order signed");
 
-  // 6. Submit to API
+  // 6. Submit to API (with retry for transient failures)
   const payload: NewOrderPayload = {
     order: serializeOrder(order, signature),
     orderType: orderType,
@@ -225,7 +309,11 @@ export async function placeHedgeOrder(params: PlaceOrderParams): Promise<PlaceOr
     ownerId,
   };
 
-  const response = await submitOrder(payload);
+  const response = await withRetry(() => submitOrder(payload), {
+    maxRetries: 2,
+    baseDelayMs: 1000,
+    maxDelayMs: 5000,
+  });
 
   // 7. Parse result
   const orderId = response.order?.id ?? "unknown";

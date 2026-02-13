@@ -43,7 +43,7 @@ function shouldLog(level: LogLevel): boolean {
 }
 
 export function createLogger(component: string) {
-  return {
+  const base = {
     info: (message: string, data?: unknown) => {
       if (shouldLog("info")) console.log(formatLog("info", component, message, data));
     },
@@ -65,6 +65,24 @@ export function createLogger(component: string) {
             console.log(formatLog("info", component, `${label} completed`, { durationMs }));
           }
         },
+      };
+    },
+  };
+
+  return {
+    ...base,
+    /**
+     * Returns a scoped logger that prefixes every message with [job:N].
+     * Per ACP best practice: include jobId in every log entry.
+     */
+    withJob(jobId: number | string) {
+      const prefix = `[job:${jobId}]`;
+      return {
+        info: (message: string, data?: unknown) => base.info(`${prefix} ${message}`, data),
+        warn: (message: string, data?: unknown) => base.warn(`${prefix} ${message}`, data),
+        error: (message: string, data?: unknown) => base.error(`${prefix} ${message}`, data),
+        debug: (message: string, data?: unknown) => base.debug(`${prefix} ${message}`, data),
+        time: (label: string) => base.time(`${prefix} ${label}`),
       };
     },
   };
