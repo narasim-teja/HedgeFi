@@ -3,7 +3,9 @@ type LogLevel = "info" | "warn" | "error" | "debug";
 function formatLog(level: LogLevel, component: string, message: string, data?: unknown): string {
   const timestamp = new Date().toISOString();
   const prefix = `[${timestamp}] [${level.toUpperCase()}] [${component}]`;
-  const dataStr = data !== undefined ? ` ${JSON.stringify(data)}` : "";
+  const dataStr = data !== undefined
+    ? ` ${data instanceof Error ? `${data.message}\n${data.stack}` : JSON.stringify(data)}`
+    : "";
   return `${prefix} ${message}${dataStr}`;
 }
 

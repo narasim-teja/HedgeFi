@@ -38,6 +38,8 @@ async function main() {
   log("Contract client built. Creating ACP client...");
 
   let jobCompleted = false;
+  let paymentSent = false;
+  let evaluationSent = false;
 
   const buyerClient = new AcpClient({
     acpContractClient: contractClient,
@@ -49,7 +51,8 @@ async function main() {
       });
 
       // When provider creates a requirement (NEGOTIATION phase), buyer pays
-      if (job.phase === AcpJobPhases.NEGOTIATION) {
+      if (job.phase === AcpJobPhases.NEGOTIATION && !paymentSent) {
+        paymentSent = true;
         log(`Job #${job.id}: Provider accepted. Paying requirement...`);
         try {
           await job.payAndAcceptRequirement("TestBuyer: Payment confirmed");
@@ -65,13 +68,16 @@ async function main() {
         hasDeliverable: !!job.deliverable,
       });
 
-      // Auto-approve the deliverable
-      try {
-        await job.evaluate(true, "TestBuyer: Deliverable approved!");
-        log(`Job #${job.id}: Evaluation approved`);
-        jobCompleted = true;
-      } catch (err) {
-        log(`Job #${job.id}: Error evaluating`, err);
+      // Auto-approve the deliverable (only once)
+      if (!evaluationSent) {
+        evaluationSent = true;
+        try {
+          await job.evaluate(true, "TestBuyer: Deliverable approved!");
+          log(`Job #${job.id}: Evaluation approved`);
+          jobCompleted = true;
+        } catch (err) {
+          log(`Job #${job.id}: Error evaluating`, err);
+        }
       }
     },
   });
