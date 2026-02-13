@@ -4,6 +4,10 @@ import type {
   HedgeAnalysisRequirement,
   HedgeAnalysisDeliverable,
 } from "../../utils/types.ts";
+import { readWalletBalances } from "../../portfolio/reader.ts";
+import { getTokenPrices } from "../../portfolio/pricer.ts";
+import { analyzeExposure } from "../../portfolio/analyzer.ts";
+import { generateReasoning } from "../../hedging/reasoning.ts";
 
 const log = createLogger("hedge-analysis");
 
@@ -37,50 +41,65 @@ export async function handleHedgeAnalysis(job: AcpJob): Promise<void> {
   const req = parseRequirement(job);
   log.info("Requirement parsed", req);
 
-  // === MOCK DELIVERABLE — replaced with real data in Phase 2+ ===
-  const deliverable: HedgeAnalysisDeliverable = {
-    exposure: {
-      total_value_usd: 5230.42,
-      tokens: [
-        { symbol: "ETH", balance: "2.15", value_usd: 3762.5, percentage: 71.9 },
-        { symbol: "USDC", balance: "1200.00", value_usd: 1200.0, percentage: 22.9 },
-        { symbol: "LINK", balance: "18.5", value_usd: 267.92, percentage: 5.1 },
-      ],
-      concentration_risk: "high",
-      top_exposure: "71.9% in ETH",
-    },
-    recommended_hedges: [
-      {
-        market_id: "mock-market-eth-below-2400",
-        market_question: "Will ETH close below $2,400 today?",
-        action: "BUY_YES",
-        shares: 200,
-        estimated_cost_usd: 24.0,
-        coverage_usd: 200.0,
-        coverage_percentage: 5.3,
-        expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-      },
-      {
-        market_id: "mock-market-eth-below-2200",
-        market_question: "Will ETH close below $2,200 today?",
-        action: "BUY_YES",
-        shares: 150,
-        estimated_cost_usd: 9.0,
-        coverage_usd: 150.0,
-        coverage_percentage: 4.0,
-        expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-      },
-    ],
-    total_hedge_cost: 33.0,
-    total_coverage: 350.0,
-    reasoning:
-      `[MOCK] Your portfolio is heavily concentrated in ETH (71.9%). ` +
-      `A 10% ETH price drop would reduce your portfolio value by ~$376. ` +
-      `Recommended: YES shares on "ETH below $2,400" and "ETH below $2,200" markets. ` +
-      `Total cost: $33 for $350 in downside coverage. Risk tolerance: ${req.risk_tolerance}.`,
-  };
+  try {
+    // Step 1: Read wallet balances
+    const rawBalances = await readWalletBalances(req.wallet_address, req.chain);
 
-  log.info(`Delivering mock hedge analysis for job #${job.id}`);
-  await job.deliver(JSON.stringify(deliverable));
-  log.info(`Job #${job.id} delivered successfully`);
+    if (rawBalances.length === 0) {
+      log.warn(`No token balances found for ${req.wallet_address} on ${req.chain}`);
+      const deliverable: HedgeAnalysisDeliverable = {
+        exposure: {
+          total_value_usd: 0,
+          tokens: [],
+          concentration_risk: "low",
+          top_exposure: "No holdings detected",
+        },
+        recommended_hedges: [],
+        total_hedge_cost: 0,
+        total_coverage: 0,
+        reasoning: "No significant token holdings were detected in this wallet on the specified chain.",
+      };
+      await job.deliver(JSON.stringify(deliverable));
+      return;
+    }
+
+    // Step 2: Fetch prices for all held tokens
+    const coingeckoIds = rawBalances.map((b) => b.coingeckoId);
+    const prices = await getTokenPrices(coingeckoIds);
+
+    // Step 3: Analyze exposure
+    const exposure = analyzeExposure(rawBalances, prices);
+
+    // Step 4: Generate AI reasoning
+    const reasoning = await generateReasoning(exposure, req.risk_tolerance);
+
+    // Step 5: Build deliverable
+    // recommended_hedges populated in Phase 3 (Limitless market scanning)
+    const deliverable: HedgeAnalysisDeliverable = {
+      exposure,
+      recommended_hedges: [],
+      total_hedge_cost: 0,
+      total_coverage: 0,
+      reasoning,
+    };
+
+    log.info(`Delivering hedge analysis for job #${job.id}`);
+    await job.deliver(JSON.stringify(deliverable));
+    log.info(`Job #${job.id} delivered successfully`);
+  } catch (err) {
+    log.error(`Failed to process hedge_analysis for job #${job.id}`, err);
+    const errorDeliverable: HedgeAnalysisDeliverable = {
+      exposure: {
+        total_value_usd: 0,
+        tokens: [],
+        concentration_risk: "low",
+        top_exposure: "Error reading portfolio",
+      },
+      recommended_hedges: [],
+      total_hedge_cost: 0,
+      total_coverage: 0,
+      reasoning: `Failed to analyze portfolio: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
+    };
+    await job.deliver(JSON.stringify(errorDeliverable));
+  }
 }
