@@ -11,7 +11,6 @@ import {
   handleCloseHedgePreview,
   handleCloseHedgeExecution,
 } from "./jobs/close-hedge.ts";
-import { getJobState } from "../db/job-state.ts";
 import type { ValidationResult } from "./validation.ts";
 import {
   validateHedgeAnalysisReq,
@@ -45,7 +44,7 @@ export async function handleNewTask(
     memoToSignId: memoToSign?.id,
   });
 
-  // Phase REQUEST: Job just arrived — accept and create requirement for payment
+  // Phase REQUEST: Job just arrived — accept, analyze, and create requirement with plan
   if (jobPhase === AcpJobPhases.REQUEST) {
     if (!jobName || !VALID_JOBS.includes(jobName)) {
       log.warn(`Job #${job.id} has invalid name: ${jobName}, rejecting`);
@@ -55,6 +54,29 @@ export async function handleNewTask(
 
     log.info(`Accepting job #${job.id} (${jobName})`);
     await job.accept(`HedgeFi accepts ${jobName} job`);
+
+    // For execute_hedge and close_hedge: run analysis/preview BEFORE payment
+    // so the buyer sees exactly what they're paying for
+    if (jobName === "execute_hedge") {
+      const planMessage = await handleExecuteHedgeAnalysis(job);
+      if (planMessage) {
+        await job.createRequirement(planMessage);
+        log.info(`Job #${job.id}: hedge plan sent, waiting for buyer review + payment`);
+      }
+      // If null, the handler already rejected/delivered (edge case)
+      return;
+    }
+
+    if (jobName === "close_hedge") {
+      const previewMessage = await handleCloseHedgePreview(job);
+      if (previewMessage) {
+        await job.createRequirement(previewMessage);
+        log.info(`Job #${job.id}: close preview sent, waiting for buyer review + payment`);
+      }
+      return;
+    }
+
+    // Default for hedge_analysis and others
     await job.createRequirement(`Please confirm payment to proceed with ${jobName}.`);
     log.info(`Job #${job.id}: requirement created, waiting for buyer payment`);
     return;
@@ -111,24 +133,12 @@ export async function handleNewTask(
       case "hedge_analysis":
         await handleHedgeAnalysis(job);
         break;
-      case "execute_hedge": {
-        const state = getJobState(String(job.id));
-        if (!state || !state.confirmation_sent) {
-          await handleExecuteHedgeAnalysis(job);
-        } else {
-          await handleExecuteHedgeExecution(job);
-        }
+      case "execute_hedge":
+        await handleExecuteHedgeExecution(job);
         break;
-      }
-      case "close_hedge": {
-        const state = getJobState(String(job.id));
-        if (!state || !state.confirmation_sent) {
-          await handleCloseHedgePreview(job);
-        } else {
-          await handleCloseHedgeExecution(job);
-        }
+      case "close_hedge":
+        await handleCloseHedgeExecution(job);
         break;
-      }
       default:
         log.error(`Job #${job.id}: unhandled job name ${jobName}`);
     }

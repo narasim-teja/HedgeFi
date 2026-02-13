@@ -45,27 +45,42 @@ async function main() {
   log("Contract client built. Creating ACP client...");
 
   let jobCompleted = false;
-  let paymentSent = false;
+  let requirementCount = 0;
   let evaluationSent = false;
 
   const buyerClient = new AcpClient({
     acpContractClient: contractClient,
     skipSocketConnection: true,
-    onNewTask: async (job: AcpJob, memoToSign?: AcpMemo) => {
+    onNewTask: async (job: AcpJob, _memoToSign?: AcpMemo) => {
       log(`onNewTask for job #${job.id}`, {
         phase: job.phase,
         name: job.name,
       });
 
-      // When provider creates a requirement (NEGOTIATION phase), buyer pays
-      if (job.phase === AcpJobPhases.NEGOTIATION && !paymentSent) {
-        paymentSent = true;
-        log(`Job #${job.id}: Provider accepted. Paying requirement...`);
+      // NEGOTIATION phase: The requirement text contains the close preview.
+      // The agent runs position lookup during REQUEST phase, so the preview
+      // is embedded in the requirement that the buyer pays for.
+      if (job.phase === AcpJobPhases.NEGOTIATION) {
+        requirementCount++;
+        log(`Job #${job.id}: [Req #${requirementCount}] Requirement received. Reviewing & paying...`);
+
+        // Log the requirement content (contains the close preview)
+        const reqContent = typeof job.requirement === "string"
+          ? job.requirement
+          : JSON.stringify(job.requirement, null, 2);
+        if (reqContent && reqContent.length > 20) {
+          log("=== CLOSE PREVIEW (from requirement) ===");
+          log(reqContent);
+          log("=== END CLOSE PREVIEW ===");
+        }
+
         try {
-          await job.payAndAcceptRequirement("TestBuyer: Payment confirmed for close_hedge");
-          log(`Job #${job.id}: Payment sent`);
+          await job.payAndAcceptRequirement(
+            `TestBuyer: Reviewed and approved close plan #${requirementCount}`
+          );
+          log(`Job #${job.id}: Requirement #${requirementCount} accepted & paid`);
         } catch (err) {
-          log(`Job #${job.id}: Error paying requirement`, err);
+          log(`Job #${job.id}: Error accepting requirement #${requirementCount}`, err);
         }
       }
     },
@@ -83,9 +98,17 @@ async function main() {
             log("=== DELIVERABLE ===");
             try {
               const parsed = JSON.parse(job.deliverable as string);
-              log("Positions closed:", parsed.positions_closed);
+              log("Positions closed:", parsed.positions_closed?.length ?? 0);
               log("Total returned USDC:", parsed.total_returned_usdc);
               log("Return tx hash:", parsed.return_tx_hash);
+              if (parsed.positions_closed?.length > 0) {
+                for (const pc of parsed.positions_closed) {
+                  log(`  ${pc.market_id}: sold ${pc.shares_sold} @ $${pc.sale_price}, P&L: $${pc.realized_pnl}`);
+                }
+              }
+              if (parsed.reasoning) {
+                log("Reasoning:", parsed.reasoning.substring(0, 200) + "...");
+              }
             } catch {
               log("Raw deliverable:", job.deliverable);
             }

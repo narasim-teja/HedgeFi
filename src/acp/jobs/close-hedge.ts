@@ -127,7 +127,12 @@ function formatCloseConfirmationMessage(plan: ClosePlanConfirmation): string {
 // Phase A: Preview positions before closing
 // =============================================
 
-export async function handleCloseHedgePreview(job: AcpJob): Promise<void> {
+/**
+ * Preview positions for closing. Returns the confirmation message text,
+ * or null if there are no positions to close (job gets rejected).
+ * Called during REQUEST phase so buyer sees the preview before paying.
+ */
+export async function handleCloseHedgePreview(job: AcpJob): Promise<string | null> {
   const jlog = log.withJob(job.id);
   jlog.info("Phase A: Previewing positions for close");
 
@@ -144,19 +149,11 @@ export async function handleCloseHedgePreview(job: AcpJob): Promise<void> {
     const buyerAddress = job.clientAddress ?? "unknown";
     const positions = resolvePositions(req, buyerAddress);
 
-    // No positions to close — skip confirmation, deliver immediately
+    // No positions to close — reject (no payment needed)
     if (positions.length === 0) {
-      jlog.info("No active positions to close");
-      const deliverable: CloseHedgeDeliverable = {
-        positions_closed: [],
-        total_returned_usdc: 0,
-        return_tx_hash: "no-active-positions",
-        reasoning: "No active hedge positions were found to close. Positions may have already been closed or expired.",
-      };
-      await job.deliver(JSON.stringify(deliverable));
-      setDelivered(String(job.id));
-      try { await job.createNotification("No active positions found to close."); } catch { /* non-fatal */ }
-      return;
+      jlog.info("No active positions to close, rejecting");
+      await job.reject("No active hedge positions were found to close. Positions may have already been closed or expired.");
+      return null;
     }
 
     // Fetch current market prices for each position
@@ -166,7 +163,6 @@ export async function handleCloseHedgePreview(job: AcpJob): Promise<void> {
       let currentPrice = pos.entry_price; // fallback to entry price
       try {
         const market = await fetchMarketBySlug(pos.market_slug);
-        // Get current price for this side
         if (pos.side === "YES" && market.prices?.[0] !== undefined) {
           currentPrice = market.prices[0];
         } else if (pos.side === "NO" && market.prices?.[1] !== undefined) {
@@ -199,44 +195,21 @@ export async function handleCloseHedgePreview(job: AcpJob): Promise<void> {
       total_estimated_pnl: planPositions.reduce((s, p) => s + p.estimated_pnl, 0),
     };
 
-    // Store the plan and send confirmation
+    // Store the plan for execution after buyer pays
     setConfirmationSent(String(job.id), JSON.stringify(plan));
 
+    // Return the formatted preview text — caller will pass to createRequirement
     const confirmationMsg = formatCloseConfirmationMessage(plan);
-    await job.createRequirement(confirmationMsg);
-    jlog.info("Close plan sent to buyer for confirmation");
+    jlog.info("Close preview built, returning to caller");
+    return confirmationMsg;
 
   } catch (err) {
     jlog.error("Failed during close hedge preview", err);
     setFailed(String(job.id));
-    try {
-      const payable = job.netPayableAmount;
-      if (payable && payable > 0) {
-        const fareAmount = new FareAmount(payable, job.baseFare);
-        await job.rejectPayable(
-          `Close hedge preview failed: ${err instanceof Error ? err.message : "Unknown error"}`,
-          fareAmount
-        );
-      } else {
-        const deliverable: CloseHedgeDeliverable = {
-          positions_closed: [],
-          total_returned_usdc: 0,
-          return_tx_hash: "error",
-          reasoning: `Failed to preview positions: ${err instanceof Error ? err.message : "Unknown error"}`,
-        };
-        await job.deliver(JSON.stringify(deliverable));
-      }
-    } catch {
-      try {
-        const deliverable: CloseHedgeDeliverable = {
-          positions_closed: [],
-          total_returned_usdc: 0,
-          return_tx_hash: "error",
-          reasoning: `Failed: ${err instanceof Error ? err.message : "Unknown error"}`,
-        };
-        await job.deliver(JSON.stringify(deliverable));
-      } catch { /* truly fatal */ }
-    }
+    await job.reject(
+      `Close hedge preview failed: ${err instanceof Error ? err.message : "Unknown error"}`
+    );
+    return null;
   }
 }
 
@@ -293,63 +266,96 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
       return;
     }
 
-    jlog.info(`Closing ${positions.length} position(s)`);
+    // Deduplicate positions on the same market/token FOR THE SAME BUYER — sell once per group
+    // to avoid "Insufficient conditional token balance" errors from sequential sells.
+    // buyer_address is included so positions from different traders are never merged.
+    const groupKey = (p: DbPosition) => `${p.buyer_address}|${p.market_slug}|${p.token_id}|${p.venue_exchange}`;
+    const grouped = new Map<string, DbPosition[]>();
+    for (const pos of positions) {
+      const key = groupKey(pos);
+      const existing = grouped.get(key);
+      if (existing) {
+        existing.push(pos);
+      } else {
+        grouped.set(key, [pos]);
+      }
+    }
+
+    jlog.info(`Closing ${positions.length} position(s) across ${grouped.size} market group(s)`);
 
     const tClose = jlog.time("Close hedge positions");
     const closedPositions: PositionClosed[] = [];
     let totalReturned = 0;
 
-    for (const pos of positions) {
-      try {
-        await ensureCtApproval(LIMITLESS_CT_CONTRACT, pos.venue_exchange);
+    for (const [, group] of grouped) {
+      const representative = group[0]!;
+      const totalShares = group.reduce((s, p) => s + p.shares, 0);
+      const totalCost = group.reduce((s, p) => s + p.total_cost_usdc, 0);
 
-        const humanShares = pos.shares / 1e6;
+      try {
+        await ensureCtApproval(LIMITLESS_CT_CONTRACT, representative.venue_exchange);
+
+        const humanShares = totalShares / 1e6;
+        jlog.info(`Selling ${humanShares.toFixed(4)} shares on ${representative.market_slug} (${group.length} position(s) merged)`);
+
         const result = await placeHedgeOrder({
-          marketSlug: pos.market_slug,
-          tokenId: pos.token_id,
+          marketSlug: representative.market_slug,
+          tokenId: representative.token_id,
           side: LimitlessOrderSide.SELL,
           usdcAmount: humanShares,
           orderType: LimitlessOrderType.FOK,
-          venueExchangeAddress: pos.venue_exchange,
+          venueExchangeAddress: representative.venue_exchange,
         });
 
         const saleAmount = result.totalCost;
-        const pnl = saleAmount - pos.total_cost_usdc;
+        const groupPnl = saleAmount - totalCost;
 
-        updatePositionStatus(pos.id, "closed", {
-          closePrice: result.avgPrice,
-          realizedPnl: Math.round(pnl * 100) / 100,
-        });
+        // Distribute sale proceeds proportionally to each position in the group
+        for (const pos of group) {
+          const sharesFraction = pos.shares / totalShares;
+          const posReturn = saleAmount * sharesFraction;
+          const posPnl = posReturn - pos.total_cost_usdc;
 
-        recordOrder({
-          positionId: pos.id,
-          orderType: "close",
-          marketSlug: pos.market_slug,
-          side: LimitlessOrderSide.SELL,
-          makerAmount: String(Math.ceil(pos.shares)),
-          takerAmount: "1",
-          price: result.avgPrice,
-          filledSize: result.filledSize,
-          orderId: result.orderId,
-          status: result.matched ? "filled" : "placed",
-        });
+          updatePositionStatus(pos.id, "closed", {
+            closePrice: result.avgPrice,
+            realizedPnl: Math.round(posPnl * 100) / 100,
+          });
 
+          recordOrder({
+            positionId: pos.id,
+            orderType: "close",
+            marketSlug: pos.market_slug,
+            side: LimitlessOrderSide.SELL,
+            makerAmount: String(Math.ceil(pos.shares)),
+            takerAmount: "1",
+            price: result.avgPrice,
+            filledSize: Math.round(result.filledSize * sharesFraction),
+            orderId: result.orderId,
+            status: result.matched ? "filled" : "placed",
+          });
+
+          jlog.info(`Closed position ${pos.id}`, {
+            orderId: result.orderId,
+            sharesFraction: `${(sharesFraction * 100).toFixed(1)}%`,
+            posReturn: Math.round(posReturn * 100) / 100,
+            pnl: Math.round(posPnl * 100) / 100,
+          });
+        }
+
+        // Single entry in deliverable per market group
         closedPositions.push({
-          market_id: pos.market_slug,
+          market_id: representative.market_slug,
           shares_sold: result.filledSize,
           sale_price: result.avgPrice,
-          realized_pnl: Math.round(pnl * 100) / 100,
+          realized_pnl: Math.round(groupPnl * 100) / 100,
         });
 
         totalReturned += saleAmount;
-        jlog.info(`Closed position ${pos.id}`, {
-          orderId: result.orderId,
-          saleAmount,
-          pnl: Math.round(pnl * 100) / 100,
-        });
       } catch (err) {
-        jlog.error(`Failed to close position ${pos.id}`, err);
-        updatePositionStatus(pos.id, "close_failed");
+        jlog.error(`Failed to close ${group.length} position(s) on ${representative.market_slug}`, err);
+        for (const pos of group) {
+          updatePositionStatus(pos.id, "close_failed");
+        }
       }
     }
     tClose.end();

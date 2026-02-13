@@ -44,27 +44,42 @@ async function main() {
   log("Contract client built. Creating ACP client...");
 
   let jobCompleted = false;
-  let paymentSent = false;
+  let requirementCount = 0;
   let evaluationSent = false;
 
   const buyerClient = new AcpClient({
     acpContractClient: contractClient,
     skipSocketConnection: true,
-    onNewTask: async (job: AcpJob, memoToSign?: AcpMemo) => {
+    onNewTask: async (job: AcpJob, _memoToSign?: AcpMemo) => {
       log(`onNewTask for job #${job.id}`, {
         phase: job.phase,
         name: job.name,
       });
 
-      // When provider creates a requirement (NEGOTIATION phase), buyer pays
-      if (job.phase === AcpJobPhases.NEGOTIATION && !paymentSent) {
-        paymentSent = true;
-        log(`Job #${job.id}: Provider accepted. Paying requirement...`);
+      // NEGOTIATION phase: The requirement text contains the hedge plan for review.
+      // The agent runs analysis during REQUEST phase, so the plan is embedded
+      // in the requirement that the buyer pays for.
+      if (job.phase === AcpJobPhases.NEGOTIATION) {
+        requirementCount++;
+        log(`Job #${job.id}: [Req #${requirementCount}] Requirement received. Reviewing & paying...`);
+
+        // Log the requirement content (contains the hedge plan)
+        const reqContent = typeof job.requirement === "string"
+          ? job.requirement
+          : JSON.stringify(job.requirement, null, 2);
+        if (reqContent && reqContent.length > 20) {
+          log("=== HEDGE PLAN (from requirement) ===");
+          log(reqContent);
+          log("=== END HEDGE PLAN ===");
+        }
+
         try {
-          await job.payAndAcceptRequirement("TestBuyer: Payment confirmed for execute_hedge");
-          log(`Job #${job.id}: Payment sent`);
+          await job.payAndAcceptRequirement(
+            `TestBuyer: Reviewed and approved hedge plan #${requirementCount}`
+          );
+          log(`Job #${job.id}: Requirement #${requirementCount} accepted & paid`);
         } catch (err) {
-          log(`Job #${job.id}: Error paying requirement`, err);
+          log(`Job #${job.id}: Error accepting requirement #${requirementCount}`, err);
         }
       }
     },
@@ -83,8 +98,17 @@ async function main() {
             try {
               const parsed = JSON.parse(job.deliverable as string);
               log("Exposure:", parsed.exposure);
-              log("Hedges placed:", parsed.hedges_placed);
+              log("Hedges placed:", parsed.hedges_placed?.length ?? 0);
               log("Summary:", parsed.summary);
+              if (parsed.summary?.deployment_ratio) {
+                log("Deployment ratio:", parsed.summary.deployment_ratio);
+              }
+              if (parsed.summary?.undeployed_usdc !== undefined) {
+                log("Undeployed USDC:", parsed.summary.undeployed_usdc);
+              }
+              if (parsed.summary?.redistribution_rounds !== undefined) {
+                log("Redistribution rounds:", parsed.summary.redistribution_rounds);
+              }
               log("Reasoning:", parsed.reasoning?.substring(0, 200) + "...");
             } catch {
               log("Raw deliverable:", job.deliverable);

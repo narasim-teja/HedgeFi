@@ -163,7 +163,12 @@ async function rejectWithRefund(
 // Phase A: Analyze wallet and propose hedge plan
 // =============================================
 
-export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<void> {
+/**
+ * Analyze wallet and build hedge plan. Returns the confirmation message text,
+ * or null if the job was already rejected/delivered (edge cases).
+ * Called during REQUEST phase so buyer sees the plan before paying.
+ */
+export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<string | null> {
   const jlog = log.withJob(job.id);
   jlog.info("Phase A: Analyzing wallet for hedge plan");
 
@@ -191,8 +196,8 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<void> {
       jlog.info("Portfolio is stablecoin-only, rejecting");
       setFailed(String(job.id));
       const reasoning = generateEdgeCaseMessage("stablecoins_only", { totalValue: exposure.total_value_usd });
-      await rejectWithRefund(job, jlog, reasoning, req.hedge_budget_usdc);
-      return;
+      await job.reject(reasoning);
+      return null;
     }
 
     // Step 2: Scan Limitless markets + build strategy
@@ -211,8 +216,8 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<void> {
       setFailed(String(job.id));
       const topNonStable = exposure.tokens.find((t) => !STABLECOIN_SYMBOLS.has(t.symbol));
       const reasoning = generateEdgeCaseMessage("no_markets_found", { topAsset: topNonStable?.symbol ?? "your holdings" });
-      await rejectWithRefund(job, jlog, reasoning, req.hedge_budget_usdc);
-      return;
+      await job.reject(reasoning);
+      return null;
     }
 
     const { recommendations: rawRecommendations, diagnostics } = buildHedgeRecommendations(
@@ -227,8 +232,8 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<void> {
     if (recommendations.length === 0) {
       jlog.info("No viable recommendations after sizing, rejecting");
       setFailed(String(job.id));
-      await rejectWithRefund(job, jlog, "No viable hedge positions could be constructed within your budget and risk parameters.", req.hedge_budget_usdc);
-      return;
+      await job.reject("No viable hedge positions could be constructed within your budget and risk parameters.");
+      return null;
     }
 
     // Build the confirmation plan
@@ -263,22 +268,21 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<void> {
       market_details: marketDetails,
     };
 
-    // Store the frozen plan for execution after confirmation
+    // Store the frozen plan for execution after buyer pays
     setConfirmationSent(String(job.id), JSON.stringify(plan));
 
-    // Send the plan to the buyer for review
+    // Return the formatted plan text — caller will pass to createRequirement
     const confirmationMsg = formatConfirmationMessage(plan);
-    await job.createRequirement(confirmationMsg);
-    jlog.info("Hedge plan sent to buyer for confirmation");
+    jlog.info("Hedge plan built, returning to caller");
+    return confirmationMsg;
 
   } catch (err) {
     jlog.error("Failed during hedge analysis phase", err);
     setFailed(String(job.id));
-    await rejectWithRefund(
-      job, jlog,
-      `Hedge analysis failed: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
-      req.hedge_budget_usdc
+    await job.reject(
+      `Hedge analysis failed: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`
     );
+    return null;
   }
 }
 
