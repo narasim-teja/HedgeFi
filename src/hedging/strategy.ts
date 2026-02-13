@@ -50,6 +50,23 @@ const TICKER_TO_COINGECKO: Record<string, string> = {
 };
 
 // =============================================
+// Strategy result types
+// =============================================
+
+export interface StrategyDiagnostics {
+  noMarketsForTickers: string[];
+  lowLiquidityMarkets: string[];
+  budgetTooSmall: boolean;
+  allStablecoins: boolean;
+  hedgeableExposures: TokenExposure[];
+}
+
+export interface StrategyResult {
+  recommendations: HedgeRecommendation[];
+  diagnostics: StrategyDiagnostics;
+}
+
+// =============================================
 // Core strategy function
 // =============================================
 
@@ -68,15 +85,23 @@ export function buildHedgeRecommendations(
   riskTolerance: string,
   hedgeBudget: number,
   currentPrices: Record<string, number> // coingeckoId -> USD price
-): HedgeRecommendation[] {
+): StrategyResult {
+  const diagnostics: StrategyDiagnostics = {
+    noMarketsForTickers: [],
+    lowLiquidityMarkets: [],
+    budgetTooSmall: false,
+    allStablecoins: false,
+    hedgeableExposures: [],
+  };
+
   if (hedgeBudget < MIN_HEDGE_BUDGET_USD) {
     log.warn(`Hedge budget $${hedgeBudget} below minimum $${MIN_HEDGE_BUDGET_USD}`);
-    return [];
+    diagnostics.budgetTooSmall = true;
+    return { recommendations: [], diagnostics };
   }
 
   if (markets.length === 0) {
     log.info("No markets available for hedging");
-    return [];
   }
 
   const config = STRATEGY_CONFIGS[riskTolerance] ?? STRATEGY_CONFIGS["moderate"]!;
@@ -93,6 +118,8 @@ export function buildHedgeRecommendations(
 
   // Determine budget allocation per ticker (proportional to exposure)
   const hedgeableExposures = getHedgeableExposures(exposure);
+  diagnostics.hedgeableExposures = hedgeableExposures;
+
   const totalHedgeableValue = hedgeableExposures.reduce(
     (sum, e) => sum + e.value_usd,
     0
@@ -100,7 +127,8 @@ export function buildHedgeRecommendations(
 
   if (totalHedgeableValue === 0) {
     log.info("No hedgeable exposure (all stablecoins?)");
-    return [];
+    diagnostics.allStablecoins = true;
+    return { recommendations: [], diagnostics };
   }
 
   const recommendations: HedgeRecommendation[] = [];
@@ -110,7 +138,10 @@ export function buildHedgeRecommendations(
     if (!ticker) continue;
 
     const tickerMarkets = marketsByTicker.get(ticker);
-    if (!tickerMarkets || tickerMarkets.length === 0) continue;
+    if (!tickerMarkets || tickerMarkets.length === 0) {
+      diagnostics.noMarketsForTickers.push(ticker);
+      continue;
+    }
 
     // Budget for this ticker, proportional to portfolio weight
     const exposurePct = tokenExp.value_usd / totalHedgeableValue;
@@ -127,7 +158,17 @@ export function buildHedgeRecommendations(
       ticker
     );
 
-    if (selectedMarkets.length === 0) continue;
+    if (selectedMarkets.length === 0) {
+      diagnostics.noMarketsForTickers.push(ticker);
+      continue;
+    }
+
+    // Track low-liquidity markets
+    for (const m of selectedMarkets) {
+      if (m.liquidityUsd < 50) {
+        diagnostics.lowLiquidityMarkets.push(m.slug);
+      }
+    }
 
     // Allocate budget across selected markets
     const marketRecs = allocateBudget(
@@ -144,9 +185,37 @@ export function buildHedgeRecommendations(
   log.info(`Built ${recommendations.length} hedge recommendations`, {
     totalCost: recommendations.reduce((s, r) => s + r.estimated_cost_usd, 0),
     totalCoverage: recommendations.reduce((s, r) => s + r.coverage_usd, 0),
+    diagnostics: {
+      noMarketsFor: diagnostics.noMarketsForTickers,
+      lowLiquidity: diagnostics.lowLiquidityMarkets.length,
+    },
   });
 
-  return recommendations;
+  return { recommendations, diagnostics };
+}
+
+/**
+ * Generate a human-readable message from strategy diagnostics.
+ * Returns null if there's nothing noteworthy to report.
+ */
+export function formatDiagnosticMessage(diagnostics: StrategyDiagnostics): string | null {
+  if (diagnostics.budgetTooSmall || diagnostics.allStablecoins) {
+    return null; // handled by edge case logic in callers
+  }
+
+  const parts: string[] = [];
+
+  if (diagnostics.noMarketsForTickers.length > 0) {
+    parts.push(`No prediction markets found for: ${diagnostics.noMarketsForTickers.join(", ")}.`);
+  }
+
+  if (diagnostics.lowLiquidityMarkets.length > 0) {
+    parts.push(
+      `${diagnostics.lowLiquidityMarkets.length} market(s) have thin liquidity (<$50) — position sizes may be reduced.`
+    );
+  }
+
+  return parts.length > 0 ? parts.join(" ") : null;
 }
 
 // =============================================
@@ -211,8 +280,6 @@ function selectMarketsForTicker(
   // Prefer markets where the hedge cost is reasonable (< $0.50/share)
   // and payout ratio is at least 1.5x
   candidates.sort((a, b) => {
-    const hedgeCostA = a.hedgeAction === "BUY_YES" ? a.yesPriceUsd : a.noPriceUsd;
-    const hedgeCostB = b.hedgeAction === "BUY_YES" ? b.yesPriceUsd : b.noPriceUsd;
     // Prefer cheaper hedges (higher payout ratio)
     if (a.payoutRatio !== b.payoutRatio) return b.payoutRatio - a.payoutRatio;
     // Then by hedge score

@@ -1,6 +1,35 @@
-type LogLevel = "info" | "warn" | "error" | "debug";
+type LogLevel = "debug" | "info" | "warn" | "error";
+
+const LOG_PRIORITIES: Record<LogLevel, number> = {
+  debug: 0,
+  info: 1,
+  warn: 2,
+  error: 3,
+};
+
+const CURRENT_LEVEL: LogLevel =
+  (process.env.LOG_LEVEL as LogLevel) in LOG_PRIORITIES
+    ? (process.env.LOG_LEVEL as LogLevel)
+    : "info";
+const CURRENT_PRIORITY = LOG_PRIORITIES[CURRENT_LEVEL];
+const USE_JSON = process.env.LOG_FORMAT === "json";
 
 function formatLog(level: LogLevel, component: string, message: string, data?: unknown): string {
+  if (USE_JSON) {
+    const entry: Record<string, unknown> = {
+      ts: new Date().toISOString(),
+      level,
+      component,
+      msg: message,
+    };
+    if (data !== undefined) {
+      entry.data = data instanceof Error
+        ? { error: data.message, stack: data.stack }
+        : data;
+    }
+    return JSON.stringify(entry);
+  }
+
   const timestamp = new Date().toISOString();
   const prefix = `[${timestamp}] [${level.toUpperCase()}] [${component}]`;
   const dataStr = data !== undefined
@@ -9,16 +38,35 @@ function formatLog(level: LogLevel, component: string, message: string, data?: u
   return `${prefix} ${message}${dataStr}`;
 }
 
+function shouldLog(level: LogLevel): boolean {
+  return LOG_PRIORITIES[level] >= CURRENT_PRIORITY;
+}
+
 export function createLogger(component: string) {
   return {
-    info: (message: string, data?: unknown) =>
-      console.log(formatLog("info", component, message, data)),
-    warn: (message: string, data?: unknown) =>
-      console.warn(formatLog("warn", component, message, data)),
-    error: (message: string, data?: unknown) =>
-      console.error(formatLog("error", component, message, data)),
-    debug: (message: string, data?: unknown) =>
-      console.log(formatLog("debug", component, message, data)),
+    info: (message: string, data?: unknown) => {
+      if (shouldLog("info")) console.log(formatLog("info", component, message, data));
+    },
+    warn: (message: string, data?: unknown) => {
+      if (shouldLog("warn")) console.warn(formatLog("warn", component, message, data));
+    },
+    error: (message: string, data?: unknown) => {
+      if (shouldLog("error")) console.error(formatLog("error", component, message, data));
+    },
+    debug: (message: string, data?: unknown) => {
+      if (shouldLog("debug")) console.log(formatLog("debug", component, message, data));
+    },
+    time: (label: string) => {
+      const start = performance.now();
+      return {
+        end: () => {
+          const durationMs = Math.round((performance.now() - start) * 100) / 100;
+          if (shouldLog("info")) {
+            console.log(formatLog("info", component, `${label} completed`, { durationMs }));
+          }
+        },
+      };
+    },
   };
 }
 

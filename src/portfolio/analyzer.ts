@@ -84,3 +84,41 @@ export function analyzeExposure(
 
   return result;
 }
+
+export function formatUsd(value: number): string {
+  return value.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+export function isStablecoinOnly(exposure: PortfolioExposure): boolean {
+  if (exposure.tokens.length === 0) return false;
+  return exposure.tokens.every((t) => STABLECOIN_SYMBOLS.has(t.symbol));
+}
+
+export function getExposureDescription(exposure: PortfolioExposure): string {
+  if (exposure.tokens.length === 0) {
+    return "No token holdings detected.";
+  }
+
+  if (isStablecoinOnly(exposure)) {
+    return `Portfolio is 100% stablecoins ($${formatUsd(exposure.total_value_usd)}). No directional risk.`;
+  }
+
+  const nonStable = exposure.tokens.filter((t) => !STABLECOIN_SYMBOLS.has(t.symbol));
+  const stableTotal = exposure.tokens
+    .filter((t) => STABLECOIN_SYMBOLS.has(t.symbol))
+    .reduce((s, t) => s + t.value_usd, 0);
+
+  const parts: string[] = [];
+  parts.push(`$${formatUsd(exposure.total_value_usd)} portfolio across ${exposure.tokens.length} tokens.`);
+
+  if (nonStable.length > 0 && nonStable[0]) {
+    parts.push(`Largest volatile position: ${nonStable[0].symbol} at ${nonStable[0].percentage}% ($${formatUsd(nonStable[0].value_usd)}).`);
+  }
+  if (stableTotal > 0) {
+    const stablePct = Math.round((stableTotal / exposure.total_value_usd) * 100);
+    parts.push(`${stablePct}% in stablecoins.`);
+  }
+  parts.push(`Concentration risk: ${exposure.concentration_risk}.`);
+
+  return parts.join(" ");
+}

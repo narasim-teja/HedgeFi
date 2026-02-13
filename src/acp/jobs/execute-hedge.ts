@@ -1,6 +1,7 @@
 import type { AcpJob } from "@virtuals-protocol/acp-node";
 import { FareAmount } from "@virtuals-protocol/acp-node";
 import { createLogger } from "../../utils/logger.ts";
+import { STABLECOIN_SYMBOLS } from "../../utils/constants.ts";
 import type {
   ExecuteHedgeRequirement,
   ExecuteHedgeDeliverable,
@@ -10,12 +11,12 @@ import type {
 import { LimitlessOrderSide, LimitlessOrderType } from "../../utils/types.ts";
 import { readWalletBalances } from "../../portfolio/reader.ts";
 import { getTokenPrices } from "../../portfolio/pricer.ts";
-import { analyzeExposure } from "../../portfolio/analyzer.ts";
-import { generateReasoning } from "../../hedging/reasoning.ts";
+import { analyzeExposure, isStablecoinOnly, formatUsd } from "../../portfolio/analyzer.ts";
+import { generateScenarioReasoning, generateEdgeCaseMessage } from "../../hedging/reasoning.ts";
 import { findHedgingMarkets } from "../../limitless/markets.ts";
 import { fetchMarketBySlug } from "../../limitless/client.ts";
 import { placeHedgeOrder } from "../../limitless/orders.ts";
-import { buildHedgeRecommendations } from "../../hedging/strategy.ts";
+import { buildHedgeRecommendations, formatDiagnosticMessage } from "../../hedging/strategy.ts";
 import { validateAndAdjustSizing, formatCoverageRatio } from "../../hedging/sizing.ts";
 import { createPosition, recordOrder } from "../../db/positions.ts";
 
@@ -45,6 +46,27 @@ function parseRequirement(job: AcpJob): ExecuteHedgeRequirement {
   return fallback;
 }
 
+function formatExecutionNotification(
+  hedgesPlaced: HedgePlaced[],
+  summary: ExecuteHedgeDeliverable["summary"]
+): string {
+  if (hedgesPlaced.length === 0) {
+    return "Hedge Execution: No positions opened. Budget returned.";
+  }
+  const marketNames = hedgesPlaced.map((h) => {
+    const shortQ = h.market_question.length > 40
+      ? h.market_question.slice(0, 37) + "..."
+      : h.market_question;
+    return shortQ;
+  });
+  return [
+    `${hedgesPlaced.length} hedge(s) placed`,
+    `Spent: $${formatUsd(summary.total_spent)}`,
+    `Max payout: $${formatUsd(summary.total_max_coverage)}`,
+    `Markets: ${marketNames.join("; ")}`,
+  ].join(" | ");
+}
+
 export async function handleExecuteHedge(job: AcpJob): Promise<void> {
   log.info(`Processing execute_hedge for job #${job.id}`);
 
@@ -53,20 +75,75 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
 
   try {
     // Step 1: Read real wallet exposure
+    const tWallet = log.time("Read wallet balances");
     const rawBalances = await readWalletBalances(req.wallet_address, req.chain);
     const coingeckoIds = rawBalances.map((b) => b.coingeckoId);
     const prices = await getTokenPrices(coingeckoIds);
     const exposure = analyzeExposure(rawBalances, prices);
+    tWallet.end();
+
+    // Edge case: stablecoin-only portfolio — reject with refund
+    if (isStablecoinOnly(exposure)) {
+      log.info("Portfolio is stablecoin-only, rejecting execute_hedge");
+      const reasoning = generateEdgeCaseMessage("stablecoins_only", {
+        totalValue: exposure.total_value_usd,
+      });
+      try {
+        const payable = (job as any).netPayableAmount;
+        if (payable && payable > 0) {
+          const fareAmount = new FareAmount(payable, (job as any).baseFare);
+          await job.rejectPayable(reasoning, fareAmount);
+          try { await job.createNotification("Portfolio is 100% stablecoins — no hedge needed. Refund issued."); } catch { /* non-fatal */ }
+          return;
+        }
+      } catch { /* fall through */ }
+      // If rejectPayable not available, deliver with reasoning
+      const deliverable: ExecuteHedgeDeliverable = {
+        exposure,
+        hedges_placed: [],
+        summary: { total_spent: 0, total_max_coverage: 0, budget_remaining: req.hedge_budget_usdc, coverage_ratio: "No hedge needed — 100% stablecoins." },
+        reasoning,
+      };
+      await job.deliver(JSON.stringify(deliverable));
+      return;
+    }
 
     // Step 2: Scan Limitless markets + build strategy
+    const tMarkets = log.time("Limitless market scan");
     let scoredMarkets: ScoredLimitlessMarket[] = [];
     try {
       scoredMarkets = await findHedgingMarkets(exposure);
     } catch (err) {
       log.warn("Failed to fetch Limitless markets", err);
     }
+    tMarkets.end();
 
-    const rawRecommendations = buildHedgeRecommendations(
+    // Edge case: no markets found — reject with refund
+    if (scoredMarkets.length === 0) {
+      const topNonStable = exposure.tokens.find((t) => !STABLECOIN_SYMBOLS.has(t.symbol));
+      const reasoning = generateEdgeCaseMessage("no_markets_found", {
+        topAsset: topNonStable?.symbol ?? "your holdings",
+      });
+      try {
+        const payable = (job as any).netPayableAmount;
+        if (payable && payable > 0) {
+          const fareAmount = new FareAmount(payable, (job as any).baseFare);
+          await job.rejectPayable(reasoning, fareAmount);
+          try { await job.createNotification("No prediction markets available — refund issued."); } catch { /* non-fatal */ }
+          return;
+        }
+      } catch { /* fall through */ }
+      const deliverable: ExecuteHedgeDeliverable = {
+        exposure,
+        hedges_placed: [],
+        summary: { total_spent: 0, total_max_coverage: 0, budget_remaining: req.hedge_budget_usdc, coverage_ratio: "No markets available for hedging." },
+        reasoning,
+      };
+      await job.deliver(JSON.stringify(deliverable));
+      return;
+    }
+
+    const { recommendations: rawRecommendations, diagnostics } = buildHedgeRecommendations(
       exposure,
       scoredMarkets,
       req.risk_tolerance,
@@ -83,14 +160,8 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
       }
     );
 
-    // Step 3: Generate reasoning
-    const reasoning = await generateReasoning(
-      exposure,
-      req.risk_tolerance,
-      recommendations
-    );
-
-    // Step 4: Place REAL orders on Limitless Exchange
+    // Step 3: Place REAL orders on Limitless Exchange
+    const tOrders = log.time("Place hedge orders");
     const hedges_placed: HedgePlaced[] = [];
     let totalSpent = 0;
 
@@ -197,6 +268,7 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
         // Continue to next recommendation — don't fail the entire job
       }
     }
+    tOrders.end();
 
     // If all orders failed but we had recommendations, refund the budget
     if (hedges_placed.length === 0 && recommendations.length > 0) {
@@ -206,11 +278,11 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
         if (payable && payable > 0) {
           const fareAmount = new FareAmount(payable, (job as any).baseFare);
           await job.rejectPayable(
-            "All hedge orders failed to execute. No positions were opened. Full refund issued.",
+            "All hedge orders failed to execute on Limitless Exchange. No positions were opened. Full refund issued.",
             fareAmount
           );
           try {
-            await job.createNotification("Hedge execution failed: no orders could be filled on Limitless Exchange");
+            await job.createNotification("Hedge execution failed: no orders could be filled on Limitless Exchange. Refund issued.");
           } catch { /* non-fatal */ }
           return;
         }
@@ -218,6 +290,35 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
         log.error(`Job #${job.id}: failed to refund after all orders failed`, refundErr);
         // Fall through to deliver a zero-result deliverable
       }
+    }
+
+    // Step 4: Generate POST-EXECUTION reasoning with actual fill data
+    const tReasoning = log.time("AI reasoning generation");
+    let reasoning: string;
+    if (hedges_placed.length > 0) {
+      reasoning = await generateScenarioReasoning({
+        type: "post_hedge_summary",
+        exposure,
+        hedgesPlaced: hedges_placed,
+        summary: {
+          totalSpent: Math.round(totalSpent * 100) / 100,
+          totalMaxCoverage: hedges_placed.reduce((s, h) => s + h.max_payout_usd, 0),
+          budgetRemaining: Math.round((req.hedge_budget_usdc - totalSpent) * 100) / 100,
+        },
+      });
+    } else {
+      reasoning = await generateScenarioReasoning({
+        type: "exposure_analysis",
+        exposure,
+        riskTolerance: req.risk_tolerance,
+      });
+    }
+    tReasoning.end();
+
+    // Append diagnostic warnings if any
+    const diagMsg = formatDiagnosticMessage(diagnostics);
+    if (diagMsg) {
+      reasoning += `\n\nNote: ${diagMsg}`;
     }
 
     const coverageRatio = formatCoverageRatio(
@@ -244,13 +345,7 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
 
     // Notification memo (mandatory for ACP graduation)
     try {
-      const notifMsg = [
-        `Hedge Execution Complete`,
-        `Spent: $${deliverable.summary.total_spent.toFixed(2)}`,
-        `Coverage: $${deliverable.summary.total_max_coverage.toFixed(2)}`,
-        `Remaining: $${deliverable.summary.budget_remaining.toFixed(2)}`,
-        `Positions: ${hedges_placed.length}`,
-      ].join(" | ");
+      const notifMsg = formatExecutionNotification(hedges_placed, deliverable.summary);
       await job.createNotification(notifMsg);
       log.info(`Job #${job.id}: notification memo sent`);
     } catch (notifErr) {

@@ -11,6 +11,8 @@ import { LimitlessOrderSide, LimitlessOrderType } from "../../utils/types.ts";
 import { placeHedgeOrder } from "../../limitless/orders.ts";
 import { ensureCtApproval } from "../../limitless/approvals.ts";
 import { LIMITLESS_CT_CONTRACT } from "../../utils/constants.ts";
+import { formatUsd } from "../../portfolio/analyzer.ts";
+import { generateScenarioReasoning } from "../../hedging/reasoning.ts";
 import {
   getActivePositions,
   getPosition,
@@ -38,6 +40,22 @@ function parseRequirement(job: AcpJob): CloseHedgeRequirement {
   }
 
   return fallback;
+}
+
+function formatCloseNotification(
+  closedPositions: PositionClosed[],
+  totalReturned: number
+): string {
+  if (closedPositions.length === 0) {
+    return "No active positions found to close.";
+  }
+  const netPnl = closedPositions.reduce((s, p) => s + p.realized_pnl, 0);
+  const pnlSign = netPnl >= 0 ? "+" : "";
+  return [
+    `Closed ${closedPositions.length} position(s)`,
+    `Returned: $${formatUsd(totalReturned)}`,
+    `Net P&L: ${pnlSign}$${formatUsd(netPnl)}`,
+  ].join(" | ");
 }
 
 export async function handleCloseHedge(job: AcpJob): Promise<void> {
@@ -71,13 +89,16 @@ export async function handleCloseHedge(job: AcpJob): Promise<void> {
         positions_closed: [],
         total_returned_usdc: 0,
         return_tx_hash: "no-active-positions",
+        reasoning: "No active hedge positions were found to close. Positions may have already been closed or expired.",
       };
       await job.deliver(JSON.stringify(deliverable));
+      try { await job.createNotification("No active positions found to close."); } catch { /* non-fatal */ }
       return;
     }
 
     log.info(`Closing ${positions.length} position(s)`);
 
+    const tClose = log.time("Close hedge positions");
     const closedPositions: PositionClosed[] = [];
     let totalReturned = 0;
 
@@ -141,6 +162,29 @@ export async function handleCloseHedge(job: AcpJob): Promise<void> {
         updatePositionStatus(pos.id, "close_failed");
       }
     }
+    tClose.end();
+
+    // Generate AI reasoning for the close
+    const tReasoning = log.time("AI reasoning generation");
+    let reasoning = "";
+    if (closedPositions.length > 0) {
+      try {
+        reasoning = await generateScenarioReasoning({
+          type: "position_close",
+          positionsClosed: closedPositions,
+          totalReturned: Math.round(totalReturned * 100) / 100,
+        });
+      } catch (err) {
+        log.warn("Failed to generate close reasoning", err);
+        const netPnl = closedPositions.reduce((s, p) => s + p.realized_pnl, 0);
+        reasoning = netPnl >= 0
+          ? `Closed ${closedPositions.length} position(s) with net profit of +$${formatUsd(netPnl)}. $${formatUsd(totalReturned)} USDC returned.`
+          : `Closed ${closedPositions.length} position(s) with net cost of $${formatUsd(Math.abs(netPnl))}. $${formatUsd(totalReturned)} USDC returned. The hedge cost served as insurance premium.`;
+      }
+    } else {
+      reasoning = "No positions could be closed. All sell orders failed to fill on Limitless Exchange.";
+    }
+    tReasoning.end();
 
     const deliverable: CloseHedgeDeliverable = {
       positions_closed: closedPositions,
@@ -149,6 +193,7 @@ export async function handleCloseHedge(job: AcpJob): Promise<void> {
         closedPositions.length > 0
           ? `limitless:batch-close-${Date.now()}`
           : "no-fills",
+      reasoning,
     };
 
     log.info(`Delivering close_hedge for job #${job.id}`, {
@@ -161,22 +206,13 @@ export async function handleCloseHedge(job: AcpJob): Promise<void> {
     // Notification memo (mandatory for ACP graduation)
     try {
       if (closedPositions.length > 0 && totalReturned > 0) {
-        const netPnl = closedPositions.reduce((s, p) => s + p.realized_pnl, 0);
-        const notifMsg = [
-          `Hedge Positions Closed`,
-          `Closed: ${closedPositions.length}`,
-          `Returned: $${deliverable.total_returned_usdc.toFixed(2)} USDC`,
-          `Net P&L: $${netPnl.toFixed(2)}`,
-        ].join(" | ");
+        const notifMsg = formatCloseNotification(closedPositions, deliverable.total_returned_usdc);
         const fareAmount = new FareAmount(totalReturned, (job as any).baseFare);
         await job.createPayableNotification(notifMsg, fareAmount);
         log.info(`Job #${job.id}: payable notification sent ($${totalReturned.toFixed(2)})`);
       } else {
-        await job.createNotification(
-          closedPositions.length === 0
-            ? "No active positions found to close."
-            : `Closed ${closedPositions.length} positions. No USDC returned (zero sale value).`
-        );
+        const notifMsg = formatCloseNotification(closedPositions, deliverable.total_returned_usdc);
+        await job.createNotification(notifMsg);
         log.info(`Job #${job.id}: notification memo sent`);
       }
     } catch (notifErr) {
@@ -200,6 +236,7 @@ export async function handleCloseHedge(job: AcpJob): Promise<void> {
           positions_closed: [],
           total_returned_usdc: 0,
           return_tx_hash: `error: ${err instanceof Error ? err.message : "unknown"}`,
+          reasoning: `Failed to close hedge positions: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
         };
         await job.deliver(JSON.stringify(errorDeliverable));
       }
@@ -210,6 +247,7 @@ export async function handleCloseHedge(job: AcpJob): Promise<void> {
           positions_closed: [],
           total_returned_usdc: 0,
           return_tx_hash: `error: ${err instanceof Error ? err.message : "unknown"}`,
+          reasoning: `Failed to close hedge positions: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
         };
         await job.deliver(JSON.stringify(errorDeliverable));
       } catch { /* truly fatal */ }

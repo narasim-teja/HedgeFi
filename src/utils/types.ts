@@ -98,6 +98,7 @@ export interface CloseHedgeDeliverable {
   positions_closed: PositionClosed[];
   total_returned_usdc: number;
   return_tx_hash: string;
+  reasoning?: string;
 }
 
 // =============================================
