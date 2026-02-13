@@ -214,6 +214,9 @@ export const MARKET_CACHE_TTL_MS = 120_000;
 // Limitless Exchange Trading (Phase 4)
 // =============================================
 
+/** Conditional Tokens (ERC-1155) contract on Base — holds all prediction market shares */
+export const LIMITLESS_CT_CONTRACT = "0xC9c98965297Bc527861c898329Ee280632B76e18" as const;
+
 /** EIP-712 domain name for Limitless CTF Exchange */
 export const LIMITLESS_EIP712_DOMAIN_NAME = "Limitless CTF Exchange" as const;
 

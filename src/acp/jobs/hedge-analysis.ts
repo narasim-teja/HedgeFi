@@ -120,6 +120,22 @@ export async function handleHedgeAnalysis(job: AcpJob): Promise<void> {
     log.info(`Delivering hedge analysis for job #${job.id}`);
     await job.deliver(JSON.stringify(deliverable));
     log.info(`Job #${job.id} delivered successfully`);
+
+    // Notification memo (mandatory for ACP graduation)
+    try {
+      const notifMsg = [
+        `Portfolio Analysis Complete`,
+        `Value: $${deliverable.exposure.total_value_usd.toFixed(2)}`,
+        `Risk: ${deliverable.exposure.concentration_risk}`,
+        `Hedges: ${deliverable.recommended_hedges.length}`,
+        `Est. Cost: $${deliverable.total_hedge_cost.toFixed(2)}`,
+        `Coverage: $${deliverable.total_coverage.toFixed(2)}`,
+      ].join(" | ");
+      await job.createNotification(notifMsg);
+      log.info(`Job #${job.id}: notification memo sent`);
+    } catch (notifErr) {
+      log.warn(`Job #${job.id}: failed to send notification memo`, notifErr);
+    }
   } catch (err) {
     log.error(`Failed to process hedge_analysis for job #${job.id}`, err);
     const errorDeliverable: HedgeAnalysisDeliverable = {
@@ -135,5 +151,11 @@ export async function handleHedgeAnalysis(job: AcpJob): Promise<void> {
       reasoning: `Failed to analyze portfolio: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
     };
     await job.deliver(JSON.stringify(errorDeliverable));
+
+    try {
+      await job.createNotification(
+        `Hedge Analysis Failed: ${err instanceof Error ? err.message : "Unknown error"}`
+      );
+    } catch { /* non-fatal */ }
   }
 }

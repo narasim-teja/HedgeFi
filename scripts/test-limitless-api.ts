@@ -21,8 +21,9 @@ async function main() {
   const markets = await fetchActiveMarkets();
   console.log(`   ✓ Fetched ${markets.length} active markets`);
   if (markets.length > 0) {
-    console.log(`   Sample: "${markets[0].title}" (slug: ${markets[0].slug})`);
-    console.log(`   Prices: buy=${markets[0].prices?.buy?.market}, liquidity=${markets[0].liquidity}`);
+    const sample = markets[0]!;
+    console.log(`   Sample: "${sample.title}" (slug: ${sample.slug})`);
+    console.log(`   Prices: yes=${sample.prices?.[0] ?? "N/A"}, no=${sample.prices?.[1] ?? "N/A"}, liquidity=${sample.liquidity}`);
   }
 
   // 2. Test semantic search

@@ -1,4 +1,5 @@
 import type { AcpJob } from "@virtuals-protocol/acp-node";
+import { FareAmount } from "@virtuals-protocol/acp-node";
 import { createLogger } from "../../utils/logger.ts";
 import type {
   ExecuteHedgeRequirement,
@@ -179,7 +180,7 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
           shares_bought: result.filledSize,
           price_per_share: result.avgPrice,
           total_cost_usd: result.totalCost,
-          max_payout_usd: result.filledSize, // Each share pays $1 if outcome triggers
+          max_payout_usd: result.filledSize / 1e6, // Each share pays $1; filledSize is raw 6-decimal
           order_id: result.orderId,
           tx_hash: `limitless:${result.orderId}`,
           expiry: rec.expiry,
@@ -194,6 +195,28 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
       } catch (err) {
         log.error(`Failed to place order for market ${rec.market_id}`, err);
         // Continue to next recommendation — don't fail the entire job
+      }
+    }
+
+    // If all orders failed but we had recommendations, refund the budget
+    if (hedges_placed.length === 0 && recommendations.length > 0) {
+      log.warn(`Job #${job.id}: all ${recommendations.length} orders failed to fill`);
+      try {
+        const payable = (job as any).netPayableAmount;
+        if (payable && payable > 0) {
+          const fareAmount = new FareAmount(payable, (job as any).baseFare);
+          await job.rejectPayable(
+            "All hedge orders failed to execute. No positions were opened. Full refund issued.",
+            fareAmount
+          );
+          try {
+            await job.createNotification("Hedge execution failed: no orders could be filled on Limitless Exchange");
+          } catch { /* non-fatal */ }
+          return;
+        }
+      } catch (refundErr) {
+        log.error(`Job #${job.id}: failed to refund after all orders failed`, refundErr);
+        // Fall through to deliver a zero-result deliverable
       }
     }
 
@@ -218,24 +241,62 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
     log.info(`Delivering execute_hedge for job #${job.id}`);
     await job.deliver(JSON.stringify(deliverable));
     log.info(`Job #${job.id} delivered successfully`);
+
+    // Notification memo (mandatory for ACP graduation)
+    try {
+      const notifMsg = [
+        `Hedge Execution Complete`,
+        `Spent: $${deliverable.summary.total_spent.toFixed(2)}`,
+        `Coverage: $${deliverable.summary.total_max_coverage.toFixed(2)}`,
+        `Remaining: $${deliverable.summary.budget_remaining.toFixed(2)}`,
+        `Positions: ${hedges_placed.length}`,
+      ].join(" | ");
+      await job.createNotification(notifMsg);
+      log.info(`Job #${job.id}: notification memo sent`);
+    } catch (notifErr) {
+      log.warn(`Job #${job.id}: failed to send notification memo`, notifErr);
+    }
   } catch (err) {
     log.error(`Failed to process execute_hedge for job #${job.id}`, err);
-    const errorDeliverable: ExecuteHedgeDeliverable = {
-      exposure: {
-        total_value_usd: 0,
-        tokens: [],
-        concentration_risk: "low",
-        top_exposure: "Error reading portfolio",
-      },
-      hedges_placed: [],
-      summary: {
-        total_spent: 0,
-        total_max_coverage: 0,
-        budget_remaining: req.hedge_budget_usdc,
-        coverage_ratio: "Error: could not analyze portfolio",
-      },
-      reasoning: `Failed to execute hedge: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
-    };
-    await job.deliver(JSON.stringify(errorDeliverable));
+
+    // Attempt refund via rejectPayable for catastrophic failures
+    try {
+      const payable = (job as any).netPayableAmount;
+      if (payable && payable > 0) {
+        const fareAmount = new FareAmount(payable, (job as any).baseFare);
+        await job.rejectPayable(
+          `Hedge execution failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+          fareAmount
+        );
+        log.info(`Job #${job.id}: refund issued via rejectPayable`);
+      } else {
+        // No payable amount — deliver error deliverable instead
+        const errorDeliverable: ExecuteHedgeDeliverable = {
+          exposure: { total_value_usd: 0, tokens: [], concentration_risk: "low", top_exposure: "Error reading portfolio" },
+          hedges_placed: [],
+          summary: { total_spent: 0, total_max_coverage: 0, budget_remaining: req.hedge_budget_usdc, coverage_ratio: "Error: could not analyze portfolio" },
+          reasoning: `Failed to execute hedge: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
+        };
+        await job.deliver(JSON.stringify(errorDeliverable));
+      }
+    } catch (rejectErr) {
+      log.error(`Job #${job.id}: failed to reject/deliver error`, rejectErr);
+      // Last resort: deliver error deliverable
+      try {
+        const errorDeliverable: ExecuteHedgeDeliverable = {
+          exposure: { total_value_usd: 0, tokens: [], concentration_risk: "low", top_exposure: "Error reading portfolio" },
+          hedges_placed: [],
+          summary: { total_spent: 0, total_max_coverage: 0, budget_remaining: req.hedge_budget_usdc, coverage_ratio: "Error: could not analyze portfolio" },
+          reasoning: `Failed to execute hedge: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
+        };
+        await job.deliver(JSON.stringify(errorDeliverable));
+      } catch { /* truly fatal */ }
+    }
+
+    try {
+      await job.createNotification(
+        `Hedge Execution Failed: ${err instanceof Error ? err.message : "Unknown error"}`
+      );
+    } catch { /* non-fatal */ }
   }
 }

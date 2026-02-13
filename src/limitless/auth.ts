@@ -91,7 +91,7 @@ export async function authenticateAgent(): Promise<void> {
     log.warn("No set-cookie header in login response");
   }
 
-  const loginData = await loginRes.json();
+  const loginData = await loginRes.json() as { account?: string; displayName?: string };
   log.info("Logged in to Limitless", {
     account: loginData.account,
     displayName: loginData.displayName,

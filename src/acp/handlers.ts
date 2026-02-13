@@ -1,14 +1,29 @@
 import type { AcpJob, AcpMemo } from "@virtuals-protocol/acp-node";
-import { AcpJobPhases } from "@virtuals-protocol/acp-node";
+import { AcpJobPhases, FareAmount } from "@virtuals-protocol/acp-node";
 import { createLogger } from "../utils/logger.ts";
 import type { JobName } from "../utils/types.ts";
 import { handleHedgeAnalysis } from "./jobs/hedge-analysis.ts";
 import { handleExecuteHedge } from "./jobs/execute-hedge.ts";
 import { handleCloseHedge } from "./jobs/close-hedge.ts";
+import type { ValidationResult } from "./validation.ts";
+import {
+  validateHedgeAnalysisReq,
+  validateExecuteHedgeReq,
+  validateCloseHedgeReq,
+} from "./validation.ts";
 
 const log = createLogger("handler");
 
 const VALID_JOBS: JobName[] = ["hedge_analysis", "execute_hedge", "close_hedge"];
+
+function parseRawRequirement(job: AcpJob): Record<string, unknown> {
+  const raw = job.requirement;
+  if (typeof raw === "string") {
+    try { return JSON.parse(raw); } catch { return {}; }
+  }
+  if (raw && typeof raw === "object") return raw as Record<string, unknown>;
+  return {};
+}
 
 export async function handleNewTask(
   job: AcpJob,
@@ -38,10 +53,49 @@ export async function handleNewTask(
     return;
   }
 
-  // Phase TRANSACTION: Buyer has paid — execute the work and deliver
+  // Phase TRANSACTION: Buyer has paid — validate requirement, then execute
   if (jobPhase === AcpJobPhases.TRANSACTION) {
     if (!jobName) {
       log.error(`Job #${job.id} in TRANSACTION phase but no name`);
+      return;
+    }
+
+    // Validate the requirement before executing
+    const rawReq = parseRawRequirement(job);
+    let validation: ValidationResult = { valid: true };
+
+    switch (jobName) {
+      case "hedge_analysis":
+        validation = validateHedgeAnalysisReq(rawReq);
+        break;
+      case "execute_hedge":
+        validation = validateExecuteHedgeReq(rawReq);
+        break;
+      case "close_hedge":
+        validation = validateCloseHedgeReq(rawReq);
+        break;
+    }
+
+    if (!validation.valid) {
+      log.warn(`Job #${job.id} validation failed: ${validation.error}`);
+      try {
+        if (
+          (jobName === "execute_hedge" || jobName === "close_hedge") &&
+          (job as any).netPayableAmount > 0
+        ) {
+          const fareAmount = new FareAmount(
+            (job as any).netPayableAmount,
+            (job as any).baseFare
+          );
+          await job.rejectPayable(`Validation failed: ${validation.error}`, fareAmount);
+        } else {
+          await job.reject(`Validation failed: ${validation.error}`);
+        }
+      } catch (rejectErr) {
+        log.error(`Job #${job.id}: failed to reject after validation`, rejectErr);
+        // Last resort: deliver error
+        await job.deliver(JSON.stringify({ error: validation.error, status: "validation_failed" }));
+      }
       return;
     }
 

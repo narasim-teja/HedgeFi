@@ -1,4 +1,5 @@
 import type { AcpJob } from "@virtuals-protocol/acp-node";
+import { FareAmount } from "@virtuals-protocol/acp-node";
 import { createLogger } from "../../utils/logger.ts";
 import type {
   CloseHedgeRequirement,
@@ -9,6 +10,7 @@ import type {
 import { LimitlessOrderSide, LimitlessOrderType } from "../../utils/types.ts";
 import { placeHedgeOrder } from "../../limitless/orders.ts";
 import { ensureCtApproval } from "../../limitless/approvals.ts";
+import { LIMITLESS_CT_CONTRACT } from "../../utils/constants.ts";
 import {
   getActivePositions,
   getPosition,
@@ -81,16 +83,19 @@ export async function handleCloseHedge(job: AcpJob): Promise<void> {
 
     for (const pos of positions) {
       try {
-        // Ensure CT (Conditional Token) approval for selling
-        // The CT contract is typically the collateral token contract for the venue
-        await ensureCtApproval(pos.token_id, pos.venue_exchange);
+        // Ensure CT (Conditional Token ERC-1155) approval for selling
+        // The CT contract holds all conditional tokens; we approve the exchange as operator
+        await ensureCtApproval(LIMITLESS_CT_CONTRACT, pos.venue_exchange);
 
         // Place a SELL order for this position's shares
+        // pos.shares is stored in raw 6-decimal format (e.g., 285714 = 0.285714 human shares)
+        // buildFokSellOrder multiplies by 1e6, so we convert back to human-readable first
+        const humanShares = pos.shares / 1e6;
         const result = await placeHedgeOrder({
           marketSlug: pos.market_slug,
           tokenId: pos.token_id,
           side: LimitlessOrderSide.SELL,
-          usdcAmount: pos.shares, // For SELL, this represents shares to sell
+          usdcAmount: humanShares,
           orderType: LimitlessOrderType.FOK,
           venueExchangeAddress: pos.venue_exchange,
         });
@@ -109,7 +114,7 @@ export async function handleCloseHedge(job: AcpJob): Promise<void> {
           orderType: "close",
           marketSlug: pos.market_slug,
           side: LimitlessOrderSide.SELL,
-          makerAmount: String(Math.ceil(pos.shares * 1e6)),
+          makerAmount: String(Math.ceil(pos.shares)),
           takerAmount: "1",
           price: result.avgPrice,
           filledSize: result.filledSize,
@@ -152,13 +157,68 @@ export async function handleCloseHedge(job: AcpJob): Promise<void> {
     });
     await job.deliver(JSON.stringify(deliverable));
     log.info(`Job #${job.id} delivered successfully`);
+
+    // Notification memo (mandatory for ACP graduation)
+    try {
+      if (closedPositions.length > 0 && totalReturned > 0) {
+        const netPnl = closedPositions.reduce((s, p) => s + p.realized_pnl, 0);
+        const notifMsg = [
+          `Hedge Positions Closed`,
+          `Closed: ${closedPositions.length}`,
+          `Returned: $${deliverable.total_returned_usdc.toFixed(2)} USDC`,
+          `Net P&L: $${netPnl.toFixed(2)}`,
+        ].join(" | ");
+        const fareAmount = new FareAmount(totalReturned, (job as any).baseFare);
+        await job.createPayableNotification(notifMsg, fareAmount);
+        log.info(`Job #${job.id}: payable notification sent ($${totalReturned.toFixed(2)})`);
+      } else {
+        await job.createNotification(
+          closedPositions.length === 0
+            ? "No active positions found to close."
+            : `Closed ${closedPositions.length} positions. No USDC returned (zero sale value).`
+        );
+        log.info(`Job #${job.id}: notification memo sent`);
+      }
+    } catch (notifErr) {
+      log.warn(`Job #${job.id}: failed to send notification memo`, notifErr);
+    }
   } catch (err) {
     log.error(`Failed to process close_hedge for job #${job.id}`, err);
-    const errorDeliverable: CloseHedgeDeliverable = {
-      positions_closed: [],
-      total_returned_usdc: 0,
-      return_tx_hash: `error: ${err instanceof Error ? err.message : "unknown"}`,
-    };
-    await job.deliver(JSON.stringify(errorDeliverable));
+
+    // Attempt refund via rejectPayable for catastrophic failures
+    try {
+      const payable = (job as any).netPayableAmount;
+      if (payable && payable > 0) {
+        const fareAmount = new FareAmount(payable, (job as any).baseFare);
+        await job.rejectPayable(
+          `Close hedge failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+          fareAmount
+        );
+        log.info(`Job #${job.id}: refund issued via rejectPayable`);
+      } else {
+        const errorDeliverable: CloseHedgeDeliverable = {
+          positions_closed: [],
+          total_returned_usdc: 0,
+          return_tx_hash: `error: ${err instanceof Error ? err.message : "unknown"}`,
+        };
+        await job.deliver(JSON.stringify(errorDeliverable));
+      }
+    } catch (rejectErr) {
+      log.error(`Job #${job.id}: failed to reject/deliver error`, rejectErr);
+      try {
+        const errorDeliverable: CloseHedgeDeliverable = {
+          positions_closed: [],
+          total_returned_usdc: 0,
+          return_tx_hash: `error: ${err instanceof Error ? err.message : "unknown"}`,
+        };
+        await job.deliver(JSON.stringify(errorDeliverable));
+      } catch { /* truly fatal */ }
+    }
+
+    try {
+      await job.createNotification(
+        `Close Hedge Failed: ${err instanceof Error ? err.message : "Unknown error"}`
+      );
+    } catch { /* non-fatal */ }
   }
 }
