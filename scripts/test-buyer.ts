@@ -43,6 +43,7 @@ async function main() {
 
   const buyerClient = new AcpClient({
     acpContractClient: contractClient,
+    skipSocketConnection: true,
     onNewTask: async (job: AcpJob, memoToSign?: AcpMemo) => {
       log(`onNewTask for job #${job.id}`, {
         phase: job.phase,

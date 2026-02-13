@@ -36,6 +36,7 @@ export async function createHedgeFiClient(): Promise<AcpClient> {
 
   const acpClient = new AcpClient({
     acpContractClient: contractClient,
+    skipSocketConnection: true,
     onNewTask: async (job: AcpJob, memoToSign?: AcpMemo) => {
       log.info(`New task received: job #${job.id}`, {
         phase: job.phase,
@@ -62,7 +63,8 @@ export async function createHedgeFiClient(): Promise<AcpClient> {
     },
   });
 
-  // Must call init() separately — sets up socket.io connection and event listeners
+  // skipSocketConnection: true in constructor prevents auto-init,
+  // so we create the socket exactly once here with proper await.
   await acpClient.init();
 
   log.info("HedgeFi ACP client initialized and connected");
