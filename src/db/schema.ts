@@ -1,0 +1,55 @@
+import { Database } from "bun:sqlite";
+import { createLogger } from "../utils/logger.ts";
+
+const log = createLogger("db-schema");
+
+const db = new Database("hedgefi.sqlite");
+
+// Enable WAL mode for better concurrent performance
+db.run("PRAGMA journal_mode = WAL");
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS positions (
+    id TEXT PRIMARY KEY,
+    job_id TEXT NOT NULL,
+    buyer_address TEXT NOT NULL,
+    market_slug TEXT NOT NULL,
+    market_title TEXT NOT NULL,
+    token_id TEXT NOT NULL,
+    side TEXT NOT NULL,
+    action TEXT NOT NULL,
+    shares INTEGER NOT NULL,
+    entry_price REAL NOT NULL,
+    total_cost_usdc REAL NOT NULL,
+    order_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    expiry TEXT NOT NULL,
+    venue_exchange TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    closed_at TEXT,
+    close_price REAL,
+    realized_pnl REAL
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS order_history (
+    id TEXT PRIMARY KEY,
+    position_id TEXT,
+    order_type TEXT NOT NULL,
+    market_slug TEXT NOT NULL,
+    side INTEGER NOT NULL,
+    maker_amount TEXT NOT NULL,
+    taker_amount TEXT NOT NULL,
+    price REAL NOT NULL,
+    filled_size REAL,
+    order_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (position_id) REFERENCES positions(id)
+  )
+`);
+
+log.info("Database schema initialized");
+
+export { db };

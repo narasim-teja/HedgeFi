@@ -3,15 +3,20 @@ import { createLogger } from "../../utils/logger.ts";
 import type {
   ExecuteHedgeRequirement,
   ExecuteHedgeDeliverable,
+  HedgePlaced,
   ScoredLimitlessMarket,
 } from "../../utils/types.ts";
+import { LimitlessOrderSide, LimitlessOrderType } from "../../utils/types.ts";
 import { readWalletBalances } from "../../portfolio/reader.ts";
 import { getTokenPrices } from "../../portfolio/pricer.ts";
 import { analyzeExposure } from "../../portfolio/analyzer.ts";
 import { generateReasoning } from "../../hedging/reasoning.ts";
 import { findHedgingMarkets } from "../../limitless/markets.ts";
+import { fetchMarketBySlug } from "../../limitless/client.ts";
+import { placeHedgeOrder } from "../../limitless/orders.ts";
 import { buildHedgeRecommendations } from "../../hedging/strategy.ts";
 import { validateAndAdjustSizing, formatCoverageRatio } from "../../hedging/sizing.ts";
+import { createPosition, recordOrder } from "../../db/positions.ts";
 
 const log = createLogger("execute-hedge");
 
@@ -84,21 +89,113 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
       recommendations
     );
 
-    // Step 4: Build hedges_placed from recommendations
-    // (order_id/tx_hash are placeholders until Phase 4 adds real Limitless order execution)
-    const hedges_placed = recommendations.map((rec) => ({
-      market_id: rec.market_id,
-      market_question: rec.market_question,
-      action: rec.action,
-      shares_bought: rec.shares,
-      price_per_share:
-        rec.shares > 0 ? Math.round((rec.estimated_cost_usd / rec.shares) * 10000) / 10000 : 0,
-      total_cost_usd: rec.estimated_cost_usd,
-      max_payout_usd: rec.coverage_usd,
-      order_id: `pending-phase4-${rec.market_id}`,
-      tx_hash: `0xpending_phase4_${rec.market_id}`,
-      expiry: rec.expiry,
-    }));
+    // Step 4: Place REAL orders on Limitless Exchange
+    const hedges_placed: HedgePlaced[] = [];
+    let totalSpent = 0;
+
+    for (const rec of recommendations) {
+      if (totalSpent >= req.hedge_budget_usdc) break;
+
+      try {
+        // Find the scored market to get slug, tokens, venue
+        const market = scoredMarkets.find(
+          (m) => m.slug === String(rec.market_id) || String(m.raw.id) === String(rec.market_id)
+        );
+
+        // Get market details — need venue.exchange for EIP-712 signing
+        let marketSlug = market?.slug ?? String(rec.market_id);
+        let venueExchange = market?.raw.venue?.exchange;
+        let tokensYes = market?.raw.tokens.yes;
+        let tokensNo = market?.raw.tokens.no;
+
+        if (!venueExchange) {
+          log.info(`Fetching full market details for ${marketSlug}`);
+          const fullMarket = await fetchMarketBySlug(marketSlug);
+          venueExchange = fullMarket.venue?.exchange;
+          tokensYes = fullMarket.tokens.yes;
+          tokensNo = fullMarket.tokens.no;
+        }
+
+        if (!venueExchange) {
+          log.warn(`No venue exchange address for market ${marketSlug}, skipping`);
+          continue;
+        }
+
+        // Determine tokenId based on hedge action
+        const tokenId = rec.action === "BUY_YES" ? tokensYes : tokensNo;
+        if (!tokenId) {
+          log.warn(`No token ID for ${rec.action} on market ${marketSlug}, skipping`);
+          continue;
+        }
+
+        const remainingBudget = req.hedge_budget_usdc - totalSpent;
+        const orderAmount = Math.min(rec.estimated_cost_usd, remainingBudget);
+
+        // Place the order on Limitless
+        const result = await placeHedgeOrder({
+          marketSlug,
+          tokenId,
+          side: LimitlessOrderSide.BUY,
+          usdcAmount: orderAmount,
+          orderType: LimitlessOrderType.FOK,
+          venueExchangeAddress: venueExchange,
+        });
+
+        // Record in database
+        const buyerAddress = (job as any).clientAddress ?? "unknown";
+        const positionId = createPosition({
+          jobId: String(job.id),
+          buyerAddress,
+          marketSlug,
+          marketTitle: rec.market_question,
+          tokenId,
+          side: rec.action === "BUY_YES" ? "YES" : "NO",
+          action: rec.action,
+          shares: result.filledSize,
+          entryPrice: result.avgPrice,
+          totalCostUsdc: result.totalCost,
+          orderId: result.orderId,
+          expiry: rec.expiry,
+          venueExchange,
+        });
+
+        recordOrder({
+          positionId,
+          orderType: "open",
+          marketSlug,
+          side: LimitlessOrderSide.BUY,
+          makerAmount: String(Math.ceil(orderAmount * 1e6)),
+          takerAmount: "1",
+          price: result.avgPrice,
+          filledSize: result.filledSize,
+          orderId: result.orderId,
+          status: result.matched ? "filled" : "placed",
+        });
+
+        hedges_placed.push({
+          market_id: rec.market_id,
+          market_question: rec.market_question,
+          action: rec.action,
+          shares_bought: result.filledSize,
+          price_per_share: result.avgPrice,
+          total_cost_usd: result.totalCost,
+          max_payout_usd: result.filledSize, // Each share pays $1 if outcome triggers
+          order_id: result.orderId,
+          tx_hash: `limitless:${result.orderId}`,
+          expiry: rec.expiry,
+        });
+
+        totalSpent += result.totalCost;
+        log.info(`Hedge placed for ${marketSlug}`, {
+          orderId: result.orderId,
+          filledSize: result.filledSize,
+          cost: result.totalCost,
+        });
+      } catch (err) {
+        log.error(`Failed to place order for market ${rec.market_id}`, err);
+        // Continue to next recommendation — don't fail the entire job
+      }
+    }
 
     const coverageRatio = formatCoverageRatio(
       summary,
@@ -110,9 +207,9 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
       exposure,
       hedges_placed,
       summary: {
-        total_spent: summary.total_hedge_cost,
-        total_max_coverage: summary.total_coverage,
-        budget_remaining: Math.round((req.hedge_budget_usdc - summary.total_hedge_cost) * 100) / 100,
+        total_spent: Math.round(totalSpent * 100) / 100,
+        total_max_coverage: hedges_placed.reduce((s, h) => s + h.max_payout_usd, 0),
+        budget_remaining: Math.round((req.hedge_budget_usdc - totalSpent) * 100) / 100,
         coverage_ratio: coverageRatio,
       },
       reasoning,

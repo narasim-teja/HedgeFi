@@ -190,6 +190,169 @@ export interface ScoredLimitlessMarket {
 }
 
 // =============================================
+// Limitless Order types (Phase 4)
+// =============================================
+
+export enum LimitlessOrderSide {
+  BUY = 0,
+  SELL = 1,
+}
+
+export enum LimitlessOrderType {
+  FOK = "FOK",
+  GTC = "GTC",
+}
+
+export enum LimitlessSignatureType {
+  EOA = 0,
+}
+
+export interface UnsignedOrder {
+  salt: bigint;
+  maker: `0x${string}`;
+  signer: `0x${string}`;
+  taker: `0x${string}`;
+  tokenId: string;
+  makerAmount: bigint;
+  takerAmount: bigint;
+  expiration: bigint;
+  nonce: bigint;
+  feeRateBps: bigint;
+  side: LimitlessOrderSide;
+  signatureType: LimitlessSignatureType;
+}
+
+export interface SignedOrder extends UnsignedOrder {
+  signature: `0x${string}`;
+}
+
+export interface NewOrderPayload {
+  order: Record<string, unknown>;
+  orderType: LimitlessOrderType;
+  marketSlug: string;
+  ownerId: number;
+}
+
+export interface LimitlessOrderResponse {
+  order: {
+    id: string;
+    createdAt: string;
+    price: number | null;
+    side: number;
+    makerAmount: number;
+    takerAmount: number;
+    tokenId: string;
+    marketId: number;
+  };
+  makerMatches?: Array<{
+    id: string;
+    matchedSize: string;
+    orderId: string;
+  }>;
+}
+
+export interface LimitlessUserProfile {
+  id: number;
+  account: string;
+  displayName?: string;
+  rank?: {
+    feeRateBps: number;
+  };
+}
+
+export interface AllowanceResponse {
+  allowance: string;
+  hasMinimumAllowance: boolean;
+  type: "clob" | "negrisk";
+  spender: string;
+  checkedAddress: string;
+}
+
+export interface PortfolioPositionsResponse {
+  clob: LimitlessApiPosition[];
+  amm: unknown[];
+  accumulativePoints: number;
+}
+
+export interface LimitlessApiPosition {
+  marketSlug: string;
+  marketTitle: string;
+  tokenId: string;
+  outcomeIndex: number;
+  shares: number;
+  avgPrice: number;
+  currentPrice: number;
+  pnl: number;
+  value: number;
+}
+
+/** Params for placing a hedge order */
+export interface PlaceOrderParams {
+  marketSlug: string;
+  tokenId: string;
+  side: LimitlessOrderSide;
+  usdcAmount: number;
+  orderType: LimitlessOrderType;
+  venueExchangeAddress: string;
+}
+
+/** Result of a placed order */
+export interface PlaceOrderResult {
+  orderId: string;
+  filledSize: number;
+  avgPrice: number;
+  totalCost: number;
+  matched: boolean;
+}
+
+// =============================================
+// Database position types (Phase 4)
+// =============================================
+
+export interface DbPosition {
+  id: string;
+  job_id: string;
+  buyer_address: string;
+  market_slug: string;
+  market_title: string;
+  token_id: string;
+  side: string;
+  action: string;
+  shares: number;
+  entry_price: number;
+  total_cost_usdc: number;
+  order_id: string;
+  status: string;
+  expiry: string;
+  venue_exchange: string;
+  created_at: string;
+  closed_at: string | null;
+  close_price: number | null;
+  realized_pnl: number | null;
+}
+
+export interface CreatePositionParams {
+  jobId: string;
+  buyerAddress: string;
+  marketSlug: string;
+  marketTitle: string;
+  tokenId: string;
+  side: string;
+  action: string;
+  shares: number;
+  entryPrice: number;
+  totalCostUsdc: number;
+  orderId: string;
+  expiry: string;
+  venueExchange: string;
+}
+
+export interface ClosingData {
+  closePrice: number;
+  realizedPnl: number;
+}
+
+// =============================================
 // Generic
 // =============================================
 

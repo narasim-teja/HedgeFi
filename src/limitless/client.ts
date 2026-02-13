@@ -8,7 +8,12 @@ import type {
   LimitlessActiveMarketsResponse,
   LimitlessOrderbook,
   LimitlessMarketSlug,
+  NewOrderPayload,
+  LimitlessOrderResponse,
+  AllowanceResponse,
+  PortfolioPositionsResponse,
 } from "../utils/types.ts";
+import { getSessionCookie, ensureAuthenticated } from "./auth.ts";
 
 const log = createLogger("limitless-client");
 
@@ -168,4 +173,110 @@ export async function fetchOrderbook(
 export function invalidateMarketCache(): void {
   cache = null;
   log.debug("Market cache invalidated");
+}
+
+// =============================================
+// Authenticated API functions (Phase 4)
+// =============================================
+
+/**
+ * Fetch helper that includes the Limitless session cookie.
+ * Automatically re-authenticates on 401.
+ */
+async function limitlessAuthFetch<T>(
+  path: string,
+  options?: { method?: string; body?: string; params?: Record<string, string | number> }
+): Promise<T> {
+  await ensureAuthenticated();
+
+  const url = new URL(`${LIMITLESS_API_BASE_URL}${path}`);
+  if (options?.params) {
+    for (const [key, value] of Object.entries(options.params)) {
+      url.searchParams.set(key, String(value));
+    }
+  }
+
+  const cookie = getSessionCookie();
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "Content-Type": "application/json",
+  };
+  if (cookie) {
+    headers["Cookie"] = `limitless_session=${cookie}`;
+  }
+
+  const maxRetries = 2;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    const response = await fetch(url.toString(), {
+      method: options?.method ?? "GET",
+      headers,
+      ...(options?.body ? { body: options.body } : {}),
+    });
+
+    if (response.status === 401 && attempt === 0) {
+      log.warn("Session expired, re-authenticating");
+      const { authenticateAgent } = await import("./auth.ts");
+      await authenticateAgent();
+      const newCookie = getSessionCookie();
+      if (newCookie) {
+        headers["Cookie"] = `limitless_session=${newCookie}`;
+      }
+      continue;
+    }
+
+    if (response.status === 429) {
+      const backoffMs = (attempt + 1) * 2000;
+      log.warn(`Rate limited (auth), retrying in ${backoffMs}ms`);
+      await new Promise((r) => setTimeout(r, backoffMs));
+      continue;
+    }
+
+    if (!response.ok) {
+      const errBody = await response.text().catch(() => "");
+      throw new Error(
+        `Limitless API error: ${response.status} ${response.statusText} for ${path} — ${errBody}`
+      );
+    }
+
+    return (await response.json()) as T;
+  }
+
+  throw new Error(`Limitless auth API request failed after ${maxRetries + 1} attempts`);
+}
+
+/**
+ * Submit a signed order to Limitless.
+ */
+export async function submitOrder(payload: NewOrderPayload): Promise<LimitlessOrderResponse> {
+  log.info("Submitting order to Limitless", { marketSlug: payload.marketSlug, orderType: payload.orderType });
+  return limitlessAuthFetch<LimitlessOrderResponse>("/orders", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+/**
+ * Cancel an open order.
+ */
+export async function cancelOrder(orderId: string): Promise<void> {
+  log.info(`Cancelling order ${orderId}`);
+  await limitlessAuthFetch<unknown>(`/orders/${orderId}`, { method: "DELETE" });
+}
+
+/**
+ * Fetch portfolio positions for the authenticated agent.
+ */
+export async function fetchPortfolioPositions(): Promise<PortfolioPositionsResponse> {
+  return limitlessAuthFetch<PortfolioPositionsResponse>("/portfolio/positions");
+}
+
+/**
+ * Check USDC trading allowance for CLOB exchange.
+ */
+export async function checkTradingAllowance(
+  type: "clob" | "negrisk" = "clob"
+): Promise<AllowanceResponse> {
+  return limitlessAuthFetch<AllowanceResponse>("/portfolio/trading/allowance", {
+    params: { type },
+  });
 }

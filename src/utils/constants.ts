@@ -205,7 +205,98 @@ export const MAX_SINGLE_MARKET_ALLOCATION = 0.50;
 export const MIN_MARKET_LIQUIDITY_USD = 10;
 
 /** Minimum hedge budget to provide meaningful coverage */
-export const MIN_HEDGE_BUDGET_USD = 5;
+export const MIN_HEDGE_BUDGET_USD = 0.5;
 
 /** Market data cache TTL */
 export const MARKET_CACHE_TTL_MS = 120_000;
+
+// =============================================
+// Limitless Exchange Trading (Phase 4)
+// =============================================
+
+/** EIP-712 domain name for Limitless CTF Exchange */
+export const LIMITLESS_EIP712_DOMAIN_NAME = "Limitless CTF Exchange" as const;
+
+/** EIP-712 domain version */
+export const LIMITLESS_EIP712_DOMAIN_VERSION = "1" as const;
+
+/** Base chain ID */
+export const BASE_CHAIN_ID = 8453;
+
+/** Zero address for open/taker-less orders */
+export const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000" as const;
+
+/** USDC decimals */
+export const USDC_DECIMALS = 6;
+
+/** Max slippage tolerance for FOK orders */
+export const MAX_FOK_SLIPPAGE_PCT = 0.05;
+
+/** Default fee rate in basis points (fallback if profile fetch fails) */
+export const DEFAULT_FEE_RATE_BPS = 300;
+
+/** EIP-712 Order type definition for Limitless CTF Exchange */
+export const EIP712_ORDER_TYPES = {
+  Order: [
+    { name: "salt", type: "uint256" },
+    { name: "maker", type: "address" },
+    { name: "signer", type: "address" },
+    { name: "taker", type: "address" },
+    { name: "tokenId", type: "uint256" },
+    { name: "makerAmount", type: "uint256" },
+    { name: "takerAmount", type: "uint256" },
+    { name: "expiration", type: "uint256" },
+    { name: "nonce", type: "uint256" },
+    { name: "feeRateBps", type: "uint256" },
+    { name: "side", type: "uint8" },
+    { name: "signatureType", type: "uint8" },
+  ],
+} as const;
+
+/** ERC-20 approve + allowance ABI entries */
+export const ERC20_APPROVE_ABI = [
+  {
+    name: "approve",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "value", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+  {
+    name: "allowance",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner", type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+] as const;
+
+/** ERC-1155 approval ABI for Conditional Tokens */
+export const ERC1155_ABI = [
+  {
+    name: "setApprovalForAll",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "operator", type: "address" },
+      { name: "approved", type: "bool" },
+    ],
+    outputs: [],
+  },
+  {
+    name: "isApprovedForAll",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "account", type: "address" },
+      { name: "operator", type: "address" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;

@@ -116,7 +116,7 @@ export function buildHedgeRecommendations(
     const exposurePct = tokenExp.value_usd / totalHedgeableValue;
     const tickerBudget = hedgeBudget * exposurePct;
 
-    if (tickerBudget < 1) continue;
+    if (tickerBudget < 0.10) continue;
 
     // Select best markets
     const selectedMarkets = selectMarketsForTicker(
@@ -253,12 +253,14 @@ function allocateBudget(
     const maxByLiquidity = market.maxFillableShares * hedgePricePerShare;
     allocation = Math.min(allocation, maxByLiquidity);
 
-    if (allocation < 0.50) continue;
+    if (allocation < 0.10) continue;
 
-    const shares = Math.floor(allocation / hedgePricePerShare);
-    if (shares <= 0) continue;
+    // For FOK orders, the exchange fills as many shares as the USDC can buy.
+    // Allow fractional shares in recommendations — actual fill is determined by the exchange.
+    const shares = allocation / hedgePricePerShare;
+    if (shares < 0.1) continue;
 
-    const estimatedCost = shares * hedgePricePerShare;
+    const estimatedCost = Math.round(allocation * 100) / 100;
     const coverageUsd = shares; // Each share pays $1 if outcome triggers
     const coveragePct =
       exposureValueUsd > 0
@@ -266,7 +268,7 @@ function allocateBudget(
         : 0;
 
     recommendations.push({
-      market_id: market.raw.id ?? market.slug,
+      market_id: String(market.raw.id ?? market.slug),
       market_question: market.title,
       action: market.hedgeAction,
       shares,
