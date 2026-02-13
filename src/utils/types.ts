@@ -379,6 +379,7 @@ export interface JobState {
   confirmation_sent: number; // 0 or 1
   confirmation_payload: string | null;
   buyer_address: string | null;
+  started_at: string | null;
   created_at: string;
   updated_at: string;
 }

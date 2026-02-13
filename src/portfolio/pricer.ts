@@ -1,7 +1,11 @@
 import { createLogger } from "../utils/logger.ts";
 import { SYMBOL_TO_COINGECKO } from "../utils/constants.ts";
+import { RateLimiter } from "../utils/rate-limiter.ts";
 
 const log = createLogger("pricer");
+
+// Rate limiter: CoinGecko free tier is more restrictive (~10-30 req/min)
+const coingeckoLimiter = new RateLimiter(2, 2);
 
 // =============================================
 // Cache
@@ -62,6 +66,7 @@ export async function getTokenPrices(
   }
 
   try {
+    await coingeckoLimiter.acquire();
     log.info(`Fetching prices for ${uniqueIds.length} tokens from CoinGecko`);
     const response = await fetch(url, { headers });
 

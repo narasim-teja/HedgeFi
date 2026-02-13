@@ -59,10 +59,10 @@ export async function createHedgeFiClient(): Promise<AcpClient> {
         await job.evaluate(result.approved, `HedgeFi: ${result.reason}`);
         log.info(`Job #${job.id} evaluation: ${result.approved ? "approved" : "rejected"} — ${result.reason}`);
       } catch (err) {
-        log.error(`Error evaluating job #${job.id}`, err);
-        // Fallback: auto-approve to avoid stuck jobs (positions already exist)
+        log.warn(`Error evaluating job #${job.id} — auto-approving (on-chain positions cannot be undone)`, err);
+        // Fallback: auto-approve to avoid stuck jobs (positions already exist on-chain)
         try {
-          await job.evaluate(true, "HedgeFi: Auto-approved (evaluation error fallback)");
+          await job.evaluate(true, "HedgeFi: Auto-approved (evaluation error — on-chain positions cannot be undone)");
         } catch (fallbackErr) {
           log.error(`Job #${job.id}: fallback evaluation also failed`, fallbackErr);
         }

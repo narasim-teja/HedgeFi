@@ -33,6 +33,10 @@ export function upsertJobState(
     if (data.phase) {
       updates.push("phase = ?");
       values.push(data.phase);
+      // Record started_at when entering execution
+      if (data.phase === "executing") {
+        updates.push("started_at = datetime('now')");
+      }
     }
     if (data.buyerAddress) {
       updates.push("buyer_address = ?");
@@ -112,4 +116,24 @@ export function cleanupOldJobs(olderThanDays: number): number {
     log.info(`Cleaned up ${deleted} old job state records (>${olderThanDays} days)`);
   }
   return deleted;
+}
+
+/**
+ * Detect and mark stuck jobs that have been "executing" for too long.
+ * Typically run once on agent startup to recover from crashes.
+ */
+export function recoverStuckJobs(stuckMinutes: number = 10): number {
+  const result = db.run(
+    `UPDATE job_state
+     SET phase = 'failed', updated_at = datetime('now')
+     WHERE phase = 'executing'
+       AND started_at IS NOT NULL
+       AND started_at < datetime('now', ? || ' minutes')`,
+    [`-${stuckMinutes}`]
+  );
+  const recovered = result.changes;
+  if (recovered > 0) {
+    log.warn(`Recovered ${recovered} stuck jobs (executing >${stuckMinutes}min)`);
+  }
+  return recovered;
 }

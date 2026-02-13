@@ -58,10 +58,18 @@ db.run(`
     confirmation_sent INTEGER NOT NULL DEFAULT 0,
     confirmation_payload TEXT,
     buyer_address TEXT,
+    started_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
   )
 `);
+
+// Migration: add started_at column if it doesn't exist (for existing databases)
+try {
+  db.run("ALTER TABLE job_state ADD COLUMN started_at TEXT");
+} catch {
+  // Column already exists — safe to ignore
+}
 
 log.info("Database schema initialized");
 

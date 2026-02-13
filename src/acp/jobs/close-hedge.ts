@@ -18,7 +18,6 @@ import { generateScenarioReasoning } from "../../hedging/reasoning.ts";
 import {
   getActivePositions,
   getPosition,
-  getAllActivePositions,
   updatePositionStatus,
   recordOrder,
 } from "../../db/positions.ts";
@@ -86,8 +85,7 @@ function resolvePositions(req: CloseHedgeRequirement, buyerAddress: string): DbP
   }
 
   if (req.close_all) {
-    const positions = getActivePositions(buyerAddress);
-    return positions.length > 0 ? positions : getAllActivePositions();
+    return getActivePositions(buyerAddress);
   }
 
   return getActivePositions(buyerAddress);
@@ -396,22 +394,23 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
       positionsClosed: closedPositions.length,
       totalReturned,
     });
-    await job.deliver(JSON.stringify(deliverable));
-    setDelivered(String(job.id));
-    jlog.info("Delivered successfully");
 
-    // Notification memo
+    // Use deliverPayable to atomically deliver result + return funds when there are proceeds
+    if (closedPositions.length > 0 && totalReturned > 0) {
+      const fareAmount = new FareAmount(totalReturned, job.baseFare);
+      await job.deliverPayable(JSON.stringify(deliverable), fareAmount);
+      jlog.info(`Delivered with fund return ($${totalReturned.toFixed(2)})`);
+    } else {
+      await job.deliver(JSON.stringify(deliverable));
+      jlog.info("Delivered (no funds to return)");
+    }
+    setDelivered(String(job.id));
+
+    // Post-delivery notification memo (summary only, funds already returned above)
     try {
-      if (closedPositions.length > 0 && totalReturned > 0) {
-        const notifMsg = formatCloseNotification(closedPositions, deliverable.total_returned_usdc);
-        const fareAmount = new FareAmount(totalReturned, job.baseFare);
-        await job.createPayableNotification(notifMsg, fareAmount);
-        jlog.info(`Payable notification sent ($${totalReturned.toFixed(2)})`);
-      } else {
-        const notifMsg = formatCloseNotification(closedPositions, deliverable.total_returned_usdc);
-        await job.createNotification(notifMsg);
-        jlog.info("Notification memo sent");
-      }
+      const notifMsg = formatCloseNotification(closedPositions, deliverable.total_returned_usdc);
+      await job.createNotification(notifMsg);
+      jlog.info("Notification memo sent");
     } catch (notifErr) {
       jlog.warn("Failed to send notification memo", notifErr);
     }

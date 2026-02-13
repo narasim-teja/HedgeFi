@@ -8,7 +8,7 @@ const log = createLogger("db-positions");
  * Create a new position record after a hedge order fills.
  */
 export function createPosition(params: CreatePositionParams): string {
-  const id = `pos_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const id = `pos_${crypto.randomUUID()}`;
 
   db.run(
     `INSERT INTO positions (id, job_id, buyer_address, market_slug, market_title, token_id, side, action, shares, entry_price, total_cost_usdc, order_id, status, expiry, venue_exchange)
@@ -115,7 +115,7 @@ export function recordOrder(params: {
   orderId: string;
   status: string;
 }): void {
-  const id = `ord_${Date.now()}_${Math.random().toString(36).substring(2, 8)}`;
+  const id = `ord_${crypto.randomUUID()}`;
 
   db.run(
     `INSERT INTO order_history (id, position_id, order_type, market_slug, side, maker_amount, taker_amount, price, filled_size, order_id, status)

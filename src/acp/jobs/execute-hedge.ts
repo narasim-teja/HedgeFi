@@ -1,7 +1,9 @@
 import type { AcpJob } from "@virtuals-protocol/acp-node";
 import { FareAmount } from "@virtuals-protocol/acp-node";
+import { createPublicClient, http } from "viem";
+import { base } from "viem/chains";
 import { createLogger } from "../../utils/logger.ts";
-import { STABLECOIN_SYMBOLS } from "../../utils/constants.ts";
+import { STABLECOIN_SYMBOLS, USDC_BASE, ERC20_ABI, CHAIN_CONFIG } from "../../utils/constants.ts";
 import type {
   ExecuteHedgeRequirement,
   ExecuteHedgeDeliverable,
@@ -30,6 +32,29 @@ const log = createLogger("execute-hedge");
 const GTC_ORDER_THRESHOLD_USD = 10;
 const REDISTRIBUTION_THRESHOLD_USD = 0.10;
 const MAX_REDISTRIBUTION_ROUNDS = 2;
+
+// =============================================
+// Agent wallet USDC balance check
+// =============================================
+
+async function getAgentUsdcBalance(): Promise<number> {
+  const walletAddress = process.env.HEDGEFI_WALLET_ADDRESS;
+  if (!walletAddress) return 0;
+
+  const client = createPublicClient({
+    chain: base,
+    transport: http(CHAIN_CONFIG.base.rpcUrl),
+  });
+
+  const raw = await client.readContract({
+    address: USDC_BASE,
+    abi: ERC20_ABI,
+    functionName: "balanceOf",
+    args: [walletAddress as `0x${string}`],
+  });
+
+  return Number(raw) / 1e6; // USDC has 6 decimals
+}
 
 // =============================================
 // Helpers
@@ -317,6 +342,24 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
   upsertJobState(String(job.id), { jobName: "execute_hedge", phase: "executing" });
 
   try {
+    // Pre-check: verify agent wallet has enough USDC to cover the budget
+    try {
+      const agentBalance = await getAgentUsdcBalance();
+      jlog.info(`Agent USDC balance: $${agentBalance.toFixed(2)}, budget: $${req.hedge_budget_usdc}`);
+      if (agentBalance < req.hedge_budget_usdc) {
+        jlog.warn(`Insufficient agent balance ($${agentBalance.toFixed(2)}) for budget ($${req.hedge_budget_usdc})`);
+        await rejectWithRefund(
+          job, jlog,
+          `Insufficient agent liquidity ($${agentBalance.toFixed(2)} available) for requested budget ($${req.hedge_budget_usdc}). Please try again later or reduce budget.`,
+          req.hedge_budget_usdc
+        );
+        setFailed(String(job.id));
+        return;
+      }
+    } catch (balErr) {
+      jlog.warn("Failed to check agent balance, proceeding anyway", balErr);
+    }
+
     const { exposure, recommendations } = plan;
 
     // Re-fetch scored markets for venue/token data (needed for order placement)
@@ -590,9 +633,18 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
     };
 
     jlog.info("Delivering execute_hedge result");
-    await job.deliver(JSON.stringify(deliverable));
+
+    // Return undeployed budget to buyer via deliverPayable if there's a meaningful remainder
+    const UNDEPLOYED_RETURN_THRESHOLD = 0.01; // $0.01 minimum to bother returning
+    if (undeployedUsdc > UNDEPLOYED_RETURN_THRESHOLD) {
+      const fareAmount = new FareAmount(undeployedUsdc, job.baseFare);
+      await job.deliverPayable(JSON.stringify(deliverable), fareAmount);
+      jlog.info(`Delivered with undeployed budget return ($${undeployedUsdc.toFixed(2)})`);
+    } else {
+      await job.deliver(JSON.stringify(deliverable));
+      jlog.info("Delivered (full budget deployed)");
+    }
     setDelivered(String(job.id));
-    jlog.info("Delivered successfully");
 
     // Notification memo
     try {

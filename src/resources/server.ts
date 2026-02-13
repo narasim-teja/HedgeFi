@@ -11,6 +11,7 @@ import type { DbPosition, ScoredLimitlessMarket } from "../utils/types.ts";
 const log = createLogger("resource-server");
 
 const RESOURCE_PORT = Number(process.env.RESOURCE_PORT ?? 3001);
+const CORS_ORIGIN = process.env.CORS_ALLOWED_ORIGIN ?? "*";
 
 // =============================================
 // Response helpers
@@ -21,7 +22,7 @@ function jsonResponse(data: unknown, status = 200): Response {
     status,
     headers: {
       "Content-Type": "application/json",
-      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Origin": CORS_ORIGIN,
     },
   });
 }
@@ -229,7 +230,7 @@ export function startResourceServer(): void {
         return new Response(null, {
           status: 204,
           headers: {
-            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Origin": CORS_ORIGIN,
             "Access-Control-Allow-Methods": "GET, OPTIONS",
             "Access-Control-Allow-Headers": "Content-Type",
           },

@@ -1,5 +1,5 @@
 import type { AcpJob, AcpMemo } from "@virtuals-protocol/acp-node";
-import { AcpJobPhases, FareAmount } from "@virtuals-protocol/acp-node";
+import { AcpJobPhases, FareAmount, MemoType } from "@virtuals-protocol/acp-node";
 import { createLogger } from "../utils/logger.ts";
 import type { JobName } from "../utils/types.ts";
 import { handleHedgeAnalysis } from "./jobs/hedge-analysis.ts";
@@ -17,6 +17,7 @@ import {
   validateExecuteHedgeReq,
   validateCloseHedgeReq,
 } from "./validation.ts";
+import { withBuyerLock } from "../utils/job-lock.ts";
 
 const log = createLogger("handler");
 
@@ -56,11 +57,22 @@ export async function handleNewTask(
     await job.accept(`HedgeFi accepts ${jobName} job`);
 
     // For execute_hedge and close_hedge: run analysis/preview BEFORE payment
-    // so the buyer sees exactly what they're paying for
+    // so the buyer sees exactly what they're paying for.
+    // Use createPayableRequirement() per ACP best practices for fund-transfer agents.
+    const agentAddress = process.env.HEDGEFI_WALLET_ADDRESS as `0x${string}` | undefined;
+
     if (jobName === "execute_hedge") {
       const planMessage = await handleExecuteHedgeAnalysis(job);
       if (planMessage) {
-        await job.createRequirement(planMessage);
+        const rawReq = parseRawRequirement(job);
+        const budget = Number(rawReq.hedge_budget_usdc) || 0;
+
+        if (agentAddress && budget > 0) {
+          const fareAmount = new FareAmount(budget, job.baseFare ?? 0);
+          await job.createPayableRequirement(planMessage, MemoType.PAYABLE_REQUEST, fareAmount, agentAddress);
+        } else {
+          await job.createRequirement(planMessage);
+        }
         log.info(`Job #${job.id}: hedge plan sent, waiting for buyer review + payment`);
       }
       // If null, the handler already rejected/delivered (edge case)
@@ -70,7 +82,12 @@ export async function handleNewTask(
     if (jobName === "close_hedge") {
       const previewMessage = await handleCloseHedgePreview(job);
       if (previewMessage) {
-        await job.createRequirement(previewMessage);
+        if (agentAddress) {
+          const fareAmount = new FareAmount(0, job.baseFare ?? 0);
+          await job.createPayableRequirement(previewMessage, MemoType.PAYABLE_REQUEST, fareAmount, agentAddress);
+        } else {
+          await job.createRequirement(previewMessage);
+        }
         log.info(`Job #${job.id}: close preview sent, waiting for buyer review + payment`);
       }
       return;
@@ -129,15 +146,18 @@ export async function handleNewTask(
 
     log.info(`Job #${job.id}: executing ${jobName}`);
 
+    const buyerAddress = job.clientAddress ?? "unknown";
+
     switch (jobName) {
       case "hedge_analysis":
         await handleHedgeAnalysis(job);
         break;
       case "execute_hedge":
-        await handleExecuteHedgeExecution(job);
+        // Per-buyer lock: serializes fund-transfer jobs for the same buyer
+        await withBuyerLock(buyerAddress, () => handleExecuteHedgeExecution(job));
         break;
       case "close_hedge":
-        await handleCloseHedgeExecution(job);
+        await withBuyerLock(buyerAddress, () => handleCloseHedgeExecution(job));
         break;
       default:
         log.error(`Job #${job.id}: unhandled job name ${jobName}`);

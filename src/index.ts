@@ -3,7 +3,7 @@ import { validateEnvironment } from "./utils/env-validator.ts";
 import { createHedgeFiClient } from "./acp/client.ts";
 import { authenticateAgent } from "./limitless/auth.ts";
 import { startResourceServer } from "./resources/server.ts";
-import { cleanupOldJobs } from "./db/job-state.ts";
+import { cleanupOldJobs, recoverStuckJobs } from "./db/job-state.ts";
 // Importing schema initializes the SQLite database on startup
 import "./db/schema.ts";
 
@@ -42,6 +42,8 @@ async function main() {
     }, CLEANUP_INTERVAL_MS);
     // Run once at startup too
     cleanupOldJobs(30);
+    // Recover any jobs stuck in "executing" from a previous crash
+    recoverStuckJobs(10);
 
     log.info("HedgeFi agent is live and listening for jobs");
     log.info(`Agent wallet: ${acpClient.walletAddress}`);

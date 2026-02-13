@@ -53,11 +53,12 @@ export async function verifyDeliverable(job: AcpJob): Promise<EvaluationResult> 
         return { approved: true, reason: `Unknown job type ${jobName}, auto-approved` };
     }
   } catch (err) {
-    log.error(`Evaluation error for job #${jobId}`, err);
-    // Auto-approve on error — positions already exist, can't undo trades
+    // Auto-approve on error — positions already exist on-chain, can't undo trades.
+    // This is intentional but we log a warning so operators can investigate.
+    log.warn(`Evaluation error for job #${jobId} — auto-approving (positions already on-chain, cannot undo)`, err);
     return {
       approved: true,
-      reason: `Evaluation error (auto-approved as fallback): ${err instanceof Error ? err.message : String(err)}`,
+      reason: `Evaluation error (auto-approved: on-chain positions cannot be undone): ${err instanceof Error ? err.message : String(err)}`,
     };
   }
 }
