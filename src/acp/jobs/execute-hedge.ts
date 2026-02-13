@@ -3,11 +3,15 @@ import { createLogger } from "../../utils/logger.ts";
 import type {
   ExecuteHedgeRequirement,
   ExecuteHedgeDeliverable,
+  ScoredLimitlessMarket,
 } from "../../utils/types.ts";
 import { readWalletBalances } from "../../portfolio/reader.ts";
 import { getTokenPrices } from "../../portfolio/pricer.ts";
 import { analyzeExposure } from "../../portfolio/analyzer.ts";
 import { generateReasoning } from "../../hedging/reasoning.ts";
+import { findHedgingMarkets } from "../../limitless/markets.ts";
+import { buildHedgeRecommendations } from "../../hedging/strategy.ts";
+import { validateAndAdjustSizing, formatCoverageRatio } from "../../hedging/sizing.ts";
 
 const log = createLogger("execute-hedge");
 
@@ -47,30 +51,69 @@ export async function handleExecuteHedge(job: AcpJob): Promise<void> {
     const coingeckoIds = rawBalances.map((b) => b.coingeckoId);
     const prices = await getTokenPrices(coingeckoIds);
     const exposure = analyzeExposure(rawBalances, prices);
-    const reasoning = await generateReasoning(exposure, req.risk_tolerance);
 
-    // Steps 2-3: Hedge execution — mock until Phase 4 (Limitless integration)
+    // Step 2: Scan Limitless markets + build strategy
+    let scoredMarkets: ScoredLimitlessMarket[] = [];
+    try {
+      scoredMarkets = await findHedgingMarkets(exposure);
+    } catch (err) {
+      log.warn("Failed to fetch Limitless markets", err);
+    }
+
+    const rawRecommendations = buildHedgeRecommendations(
+      exposure,
+      scoredMarkets,
+      req.risk_tolerance,
+      req.hedge_budget_usdc,
+      prices
+    );
+
+    const { adjusted: recommendations, summary } = validateAndAdjustSizing(
+      rawRecommendations,
+      {
+        hedgeBudget: req.hedge_budget_usdc,
+        riskTolerance: req.risk_tolerance,
+        portfolioValueUsd: exposure.total_value_usd,
+      }
+    );
+
+    // Step 3: Generate reasoning
+    const reasoning = await generateReasoning(
+      exposure,
+      req.risk_tolerance,
+      recommendations
+    );
+
+    // Step 4: Build hedges_placed from recommendations
+    // (order_id/tx_hash are placeholders until Phase 4 adds real Limitless order execution)
+    const hedges_placed = recommendations.map((rec) => ({
+      market_id: rec.market_id,
+      market_question: rec.market_question,
+      action: rec.action,
+      shares_bought: rec.shares,
+      price_per_share:
+        rec.shares > 0 ? Math.round((rec.estimated_cost_usd / rec.shares) * 10000) / 10000 : 0,
+      total_cost_usd: rec.estimated_cost_usd,
+      max_payout_usd: rec.coverage_usd,
+      order_id: `pending-phase4-${rec.market_id}`,
+      tx_hash: `0xpending_phase4_${rec.market_id}`,
+      expiry: rec.expiry,
+    }));
+
+    const coverageRatio = formatCoverageRatio(
+      summary,
+      exposure.total_value_usd,
+      req.risk_tolerance
+    );
+
     const deliverable: ExecuteHedgeDeliverable = {
       exposure,
-      hedges_placed: [
-        {
-          market_id: "mock-market-eth-below-2400",
-          market_question: "Will ETH close below $2,400 today?",
-          action: "BUY_YES",
-          shares_bought: 200,
-          price_per_share: 0.12,
-          total_cost_usd: 24.0,
-          max_payout_usd: 200.0,
-          order_id: "mock-order-001",
-          tx_hash: "0xmock_tx_hash_001",
-          expiry: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
-        },
-      ],
+      hedges_placed,
       summary: {
-        total_spent: 24.0,
-        total_max_coverage: 200.0,
-        budget_remaining: req.hedge_budget_usdc - 24.0,
-        coverage_ratio: `[MOCK] Protecting ~5.3% of your $${exposure.total_value_usd} exposure for 24h`,
+        total_spent: summary.total_hedge_cost,
+        total_max_coverage: summary.total_coverage,
+        budget_remaining: Math.round((req.hedge_budget_usdc - summary.total_hedge_cost) * 100) / 100,
+        coverage_ratio: coverageRatio,
       },
       reasoning,
     };

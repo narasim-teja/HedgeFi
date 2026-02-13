@@ -101,6 +101,95 @@ export interface CloseHedgeDeliverable {
 }
 
 // =============================================
+// Limitless Exchange types
+// =============================================
+
+/** Raw market data as returned by Limitless API /markets/active */
+export interface LimitlessMarketRaw {
+  id: number;
+  slug: string;
+  title: string;
+  description?: string;
+  collateralToken: {
+    address: string;
+    decimals: number;
+    symbol: string;
+  };
+  expirationTimestamp: number; // milliseconds
+  tokens: {
+    yes: string;
+    no: string;
+  };
+  prices: [number, number]; // [yesPrice, noPrice]
+  venue?: {
+    exchange: string;
+    adapter: string | null;
+  };
+  priceOracleMetadata?: {
+    ticker: string;
+    assetType: string;
+    pythAddress?: string;
+    symbol?: string;
+    name?: string;
+  };
+  metadata?: {
+    fee: boolean;
+    openPrice?: string; // strike price as string
+  };
+  volume?: string;
+  volumeFormatted?: string;
+  liquidity?: number | null;
+  tradeType?: string;
+  marketType?: string;
+  status?: string;
+  expired?: boolean;
+}
+
+/** Metadata from /markets/active/slugs endpoint */
+export interface LimitlessMarketSlug {
+  slug: string;
+  strikePrice: string | null;
+  ticker: string | null;
+  deadline: string | null;
+  markets?: { slug: string }[];
+}
+
+/** Orderbook snapshot from /markets/{slug}/orderbook */
+export interface LimitlessOrderbook {
+  adjustedMidpoint: number;
+  asks: Array<{ price: number; size: number }>;
+  bids: Array<{ price: number; size: number }>;
+  lastTradePrice: number;
+  maxSpread: number;
+  minSize: number;
+  tokenId: string;
+}
+
+/** Active markets API response wrapper */
+export interface LimitlessActiveMarketsResponse {
+  data: LimitlessMarketRaw[];
+  totalMarketsCount: number;
+}
+
+/** A market enriched with hedging-relevant metadata and scores */
+export interface ScoredLimitlessMarket {
+  raw: LimitlessMarketRaw;
+  slug: string;
+  title: string;
+  ticker: string;
+  strikePrice: number | null;
+  direction: "below" | "above";
+  expirationDate: Date;
+  yesPriceUsd: number;
+  noPriceUsd: number;
+  hedgeAction: "BUY_YES" | "BUY_NO";
+  hedgeScore: number;
+  liquidityUsd: number;
+  maxFillableShares: number;
+  payoutRatio: number;
+}
+
+// =============================================
 // Generic
 // =============================================
 

@@ -1,6 +1,6 @@
 import { GoogleGenAI } from "@google/genai";
 import { createLogger } from "../utils/logger.ts";
-import type { PortfolioExposure } from "../utils/types.ts";
+import type { PortfolioExposure, HedgeRecommendation } from "../utils/types.ts";
 
 const log = createLogger("reasoning");
 
@@ -19,24 +19,27 @@ function getClient(): GoogleGenAI {
 
 const SYSTEM_PROMPT = `You are a DeFi risk analyst working for HedgeFi, an autonomous portfolio hedging agent.
 Your job is to analyze portfolio exposure and explain risks in plain English.
+HedgeFi uses prediction markets on Limitless Exchange to construct hedges.
 
 Guidelines:
 - Be specific: reference actual token names, percentages, and dollar amounts from the data.
 - Be concise: 2-3 short paragraphs maximum.
 - Focus on: concentration risk, volatility exposure, and what price movements would hurt this portfolio.
+- When hedge recommendations are provided, explain why each market was chosen and how the payout works.
+- Explain prediction market hedging simply: "If ETH drops below $X, these shares pay out $1 each, offsetting your loss."
 - If the portfolio is well-diversified, say so.
 - If concentration is high, explain why that is risky and what a hedge would protect against.
-- Do NOT recommend specific prediction markets (that is handled separately).
 - Do NOT include disclaimers or financial advice warnings.
 - Speak directly to the user ("Your portfolio...", "You are exposed to...").`;
 
 export async function generateReasoning(
   exposure: PortfolioExposure,
-  riskTolerance: string
+  riskTolerance: string,
+  recommendations?: HedgeRecommendation[]
 ): Promise<string> {
   const client = getClient();
 
-  const userPrompt = `Analyze this portfolio exposure and explain the risks:
+  let userPrompt = `Analyze this portfolio exposure and explain the risks:
 
 Portfolio Total Value: $${exposure.total_value_usd.toLocaleString()}
 Concentration Risk: ${exposure.concentration_risk}
@@ -49,9 +52,26 @@ ${exposure.tokens
     (t) =>
       `- ${t.symbol}: ${t.balance} ($${t.value_usd.toLocaleString()}, ${t.percentage}%)`
   )
+  .join("\n")}`;
+
+  if (recommendations && recommendations.length > 0) {
+    userPrompt += `
+
+Recommended Hedges (from Limitless Exchange prediction markets):
+${recommendations
+  .map(
+    (r) =>
+      `- Market: "${r.market_question}" | Action: ${r.action} | Shares: ${r.shares} | ` +
+      `Cost: $${r.estimated_cost_usd} | Coverage: $${r.coverage_usd} (${r.coverage_percentage}%) | Expiry: ${r.expiry}`
+  )
   .join("\n")}
 
-Provide a risk assessment and explain what hedges would be appropriate for this portfolio given the ${riskTolerance} risk tolerance.`;
+Explain why these specific markets were chosen and how they protect the portfolio. Reference the strike prices and how they relate to current exposure. Explain the cost vs coverage tradeoff.`;
+  } else {
+    userPrompt += `
+
+No suitable prediction markets are currently available on Limitless Exchange for hedging this portfolio. Explain the risks and what kinds of markets would be useful when they become available.`;
+  }
 
   try {
     log.info("Generating reasoning with Gemini");

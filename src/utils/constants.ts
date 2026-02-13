@@ -172,3 +172,40 @@ SYMBOL_TO_COINGECKO["ETH"] = "ethereum";
 export const STABLECOIN_SYMBOLS = new Set(
   TOKENS.filter((t) => t.isStablecoin).map((t) => t.symbol)
 );
+
+// =============================================
+// Limitless Exchange API
+// =============================================
+
+export const LIMITLESS_API_BASE_URL = "https://api.limitless.exchange";
+
+/** Map portfolio token symbols to Limitless market tickers */
+export const SYMBOL_TO_LIMITLESS_TICKER: Record<string, string> = {
+  ETH: "ETH",
+  WETH: "ETH",
+  WBTC: "BTC",
+  cbBTC: "BTC",
+  LINK: "LINK",
+  UNI: "UNI",
+  ARB: "ARB",
+  AAVE: "AAVE",
+};
+
+/** Risk tolerance to target drop percentage range for strike selection */
+export const RISK_TOLERANCE_DROP_TARGETS: Record<string, number[]> = {
+  conservative: [0.03, 0.05],
+  moderate: [0.05, 0.10],
+  aggressive: [0.10, 0.20],
+};
+
+/** Max percentage of budget for a single market */
+export const MAX_SINGLE_MARKET_ALLOCATION = 0.50;
+
+/** Minimum liquidity (USD) for a market to be considered */
+export const MIN_MARKET_LIQUIDITY_USD = 10;
+
+/** Minimum hedge budget to provide meaningful coverage */
+export const MIN_HEDGE_BUDGET_USD = 5;
+
+/** Market data cache TTL */
+export const MARKET_CACHE_TTL_MS = 120_000;

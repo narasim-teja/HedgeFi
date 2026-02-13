@@ -3,11 +3,15 @@ import { createLogger } from "../../utils/logger.ts";
 import type {
   HedgeAnalysisRequirement,
   HedgeAnalysisDeliverable,
+  ScoredLimitlessMarket,
 } from "../../utils/types.ts";
 import { readWalletBalances } from "../../portfolio/reader.ts";
 import { getTokenPrices } from "../../portfolio/pricer.ts";
 import { analyzeExposure } from "../../portfolio/analyzer.ts";
 import { generateReasoning } from "../../hedging/reasoning.ts";
+import { findHedgingMarkets } from "../../limitless/markets.ts";
+import { buildHedgeRecommendations } from "../../hedging/strategy.ts";
+import { validateAndAdjustSizing } from "../../hedging/sizing.ts";
 
 const log = createLogger("hedge-analysis");
 
@@ -70,16 +74,46 @@ export async function handleHedgeAnalysis(job: AcpJob): Promise<void> {
     // Step 3: Analyze exposure
     const exposure = analyzeExposure(rawBalances, prices);
 
-    // Step 4: Generate AI reasoning
-    const reasoning = await generateReasoning(exposure, req.risk_tolerance);
+    // Step 4: Scan Limitless markets for hedging opportunities
+    let scoredMarkets: ScoredLimitlessMarket[] = [];
+    try {
+      scoredMarkets = await findHedgingMarkets(exposure);
+    } catch (err) {
+      log.warn("Failed to fetch Limitless markets, continuing without", err);
+    }
 
-    // Step 5: Build deliverable
-    // recommended_hedges populated in Phase 3 (Limitless market scanning)
+    // Step 5: Build hedge recommendations
+    const rawRecommendations = buildHedgeRecommendations(
+      exposure,
+      scoredMarkets,
+      req.risk_tolerance,
+      req.hedge_budget,
+      prices
+    );
+
+    // Step 6: Validate sizing
+    const { adjusted: recommendations, summary } = validateAndAdjustSizing(
+      rawRecommendations,
+      {
+        hedgeBudget: req.hedge_budget,
+        riskTolerance: req.risk_tolerance,
+        portfolioValueUsd: exposure.total_value_usd,
+      }
+    );
+
+    // Step 7: Generate AI reasoning (enhanced with market data)
+    const reasoning = await generateReasoning(
+      exposure,
+      req.risk_tolerance,
+      recommendations
+    );
+
+    // Step 8: Build deliverable
     const deliverable: HedgeAnalysisDeliverable = {
       exposure,
-      recommended_hedges: [],
-      total_hedge_cost: 0,
-      total_coverage: 0,
+      recommended_hedges: recommendations,
+      total_hedge_cost: summary.total_hedge_cost,
+      total_coverage: summary.total_coverage,
       reasoning,
     };
 
