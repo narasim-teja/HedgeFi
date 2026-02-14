@@ -200,6 +200,64 @@ describe("Position isolation (security fix)", () => {
     const id2 = await createTestPosition(buyerA, "market-u2");
     expect(id1).not.toBe(id2);
   });
+
+  // --- Cross-buyer close isolation (CVE-like: buyer B cannot close buyer A's positions) ---
+
+  test("resolvePositions with position_ids filters out positions not owned by the caller", async () => {
+    const { resolvePositions } = await import("../acp/jobs/close-hedge.ts");
+
+    const posIdA = await createTestPosition(buyerA, "market-cross-1");
+    const posIdB = await createTestPosition(buyerB, "market-cross-2");
+
+    // Buyer B tries to close buyer A's position by ID
+    const resolved = await resolvePositions({ position_ids: [posIdA] }, buyerB);
+    expect(resolved.length).toBe(0); // should be empty — buyer B doesn't own posIdA
+
+    // Buyer A can close their own position
+    const resolvedA = await resolvePositions({ position_ids: [posIdA] }, buyerA);
+    expect(resolvedA.length).toBe(1);
+    expect(resolvedA[0]!.id).toBe(posIdA);
+
+    // Buyer B can close their own position
+    const resolvedB = await resolvePositions({ position_ids: [posIdB] }, buyerB);
+    expect(resolvedB.length).toBe(1);
+    expect(resolvedB[0]!.id).toBe(posIdB);
+  });
+
+  test("resolvePositions with close_all only returns the caller's positions", async () => {
+    const { resolvePositions } = await import("../acp/jobs/close-hedge.ts");
+
+    await createTestPosition(buyerA, "market-all-1");
+    await createTestPosition(buyerA, "market-all-2");
+    await createTestPosition(buyerB, "market-all-3");
+
+    const resolvedA = await resolvePositions({ close_all: true }, buyerA);
+    expect(resolvedA.length).toBe(2);
+    expect(resolvedA.every((p) => p.buyer_address === buyerA)).toBe(true);
+
+    const resolvedB = await resolvePositions({ close_all: true }, buyerB);
+    expect(resolvedB.length).toBe(1);
+    expect(resolvedB.every((p) => p.buyer_address === buyerB)).toBe(true);
+  });
+
+  test("resolvePositions with mixed valid/invalid IDs only returns caller's active positions", async () => {
+    const { resolvePositions } = await import("../acp/jobs/close-hedge.ts");
+
+    const posA1 = await createTestPosition(buyerA, "market-mix-1");
+    const posA2 = await createTestPosition(buyerA, "market-mix-2");
+    const posB1 = await createTestPosition(buyerB, "market-mix-3");
+
+    // Buyer B provides a mix: their own position + buyer A's positions + a nonexistent ID
+    const resolved = await resolvePositions(
+      { position_ids: [posA1, posA2, posB1, "pos_nonexistent-id"] },
+      buyerB
+    );
+
+    // Only buyer B's own active position should be returned
+    expect(resolved.length).toBe(1);
+    expect(resolved[0]!.id).toBe(posB1);
+    expect(resolved[0]!.buyer_address).toBe(buyerB);
+  });
 });
 
 // =============================================

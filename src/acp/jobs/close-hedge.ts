@@ -88,10 +88,13 @@ function formatExpiryHuman(expiryIso: string): string {
 /**
  * Look up positions to close based on the requirement.
  */
-async function resolvePositions(req: CloseHedgeRequirement, buyerAddress: string): Promise<DbPosition[]> {
+export async function resolvePositions(req: CloseHedgeRequirement, buyerAddress: string): Promise<DbPosition[]> {
   if (req.position_ids && req.position_ids.length > 0) {
     const results = await Promise.all(req.position_ids.map((id) => getPosition(id)));
-    return results.filter((p): p is DbPosition => p !== null && p.status === "active");
+    // SECURITY: only allow closing positions owned by the requesting buyer
+    return results.filter((p): p is DbPosition =>
+      p !== null && p.status === "active" && p.buyer_address === buyerAddress
+    );
   }
 
   if (req.close_all) {
@@ -270,9 +273,10 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
         jlog.warn(`${alreadyClosed.length} position(s) already closed: ${alreadyClosed.map((l) => l.id).join(", ")}`);
       }
 
+      // SECURITY: only allow closing positions owned by the requesting buyer
       positions = lookups
         .map((l) => l.pos)
-        .filter((p): p is DbPosition => p !== null && p.status === "active");
+        .filter((p): p is DbPosition => p !== null && p.status === "active" && p.buyer_address === buyerAddress);
     } else {
       positions = await resolvePositions(req, buyerAddress);
     }
