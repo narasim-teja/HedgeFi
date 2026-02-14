@@ -1,15 +1,15 @@
-import { SQL } from "bun";
+import { getDb } from "./connection.ts";
 import { createLogger } from "../utils/logger.ts";
 
 const log = createLogger("db-schema");
-
-const sql = new SQL(process.env.DATABASE_URL);
 
 /**
  * Initialize the database schema (creates tables if they don't exist).
  * Must be called once at startup before any DB operations.
  */
 export async function initSchema(): Promise<void> {
+  const sql = getDb();
+
   await sql`
     CREATE TABLE IF NOT EXISTS positions (
       id TEXT PRIMARY KEY,
@@ -68,5 +68,3 @@ export async function initSchema(): Promise<void> {
 
   log.info("Database schema initialized");
 }
-
-export { sql };

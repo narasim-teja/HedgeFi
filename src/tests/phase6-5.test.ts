@@ -197,16 +197,16 @@ import {
   setFailed,
   cleanupOldJobs,
 } from "../db/job-state.ts";
-import { sql } from "../db/schema.ts";
+import { getDb } from "../db/connection.ts";
 
 describe("Job State CRUD", () => {
   beforeEach(async () => {
     // Clean up any test rows
-    await sql`DELETE FROM job_state WHERE job_id LIKE 'test-%'`;
+    await getDb()`DELETE FROM job_state WHERE job_id LIKE 'test-%'`;
   });
 
   afterEach(async () => {
-    await sql`DELETE FROM job_state WHERE job_id LIKE 'test-%'`;
+    await getDb()`DELETE FROM job_state WHERE job_id LIKE 'test-%'`;
   });
 
   test("upsertJobState creates a new record", async () => {

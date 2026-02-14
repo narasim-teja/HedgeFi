@@ -12,6 +12,9 @@ const log = createLogger("acp-client");
 // Dedup guard for evaluation — prevents duplicate socket events
 const evaluatingJobs = new Set<number>();
 
+// Module-level reference for health checks and re-initialization
+let acpClientInstance: AcpClient | null = null;
+
 export async function createHedgeFiClient(): Promise<AcpClient> {
   const privateKey = process.env.HEDGEFI_PRIVATE_KEY;
   const entityId = process.env.HEDGEFI_ENTITY_ID;
@@ -54,6 +57,11 @@ export async function createHedgeFiClient(): Promise<AcpClient> {
       }
     },
     onEvaluate: async (job: AcpJob) => {
+      // Memory cap: prevent unbounded growth under extreme load
+      if (evaluatingJobs.size > 500) {
+        log.warn(`Evaluation dedup set reached ${evaluatingJobs.size} entries, clearing stale entries`);
+        evaluatingJobs.clear();
+      }
       // Dedup: skip if we're already evaluating this job
       if (evaluatingJobs.has(job.id)) {
         log.debug(`Job #${job.id} evaluation already in progress, skipping duplicate`);
@@ -87,6 +95,30 @@ export async function createHedgeFiClient(): Promise<AcpClient> {
   // so we create the socket exactly once here with proper await.
   await acpClient.init();
 
+  acpClientInstance = acpClient;
   log.info("HedgeFi ACP client initialized and connected");
   return acpClient;
+}
+
+/**
+ * Check ACP client health by making a lightweight SDK call.
+ * Returns true if the client can successfully communicate with ACP.
+ */
+export async function checkAcpHealth(): Promise<boolean> {
+  if (!acpClientInstance) return false;
+  try {
+    await acpClientInstance.getActiveJobs(1, 1);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Re-initialize the ACP client (e.g., after repeated health check failures).
+ */
+export async function reinitializeAcpClient(): Promise<AcpClient> {
+  log.warn("Re-initializing ACP client due to health check failures");
+  acpClientInstance = null;
+  return createHedgeFiClient();
 }

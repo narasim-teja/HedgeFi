@@ -5,8 +5,11 @@ import {
   getHistoricalPositions,
   getPositionsForMarket,
 } from "../db/positions.ts";
+import { getDb } from "../db/connection.ts";
 import { getMarketsForAsset } from "../limitless/markets.ts";
 import { fetchMarketBySlug } from "../limitless/client.ts";
+import { jobQueue } from "../acp/handlers.ts";
+import { checkAcpHealth } from "../acp/client.ts";
 import type { DbPosition, ScoredLimitlessMarket, MarketTimeframe } from "../utils/types.ts";
 
 const log = createLogger("resource-server");
@@ -227,7 +230,7 @@ async function handleAvailableMarkets(url: URL): Promise<Response> {
 // Server
 // =============================================
 
-export function startResourceServer(): void {
+export function startResourceServer(): ReturnType<typeof Bun.serve> {
   const server = Bun.serve({
     port: RESOURCE_PORT,
     async fetch(req) {
@@ -263,21 +266,49 @@ export function startResourceServer(): void {
         case "/resources/available-markets":
           return handleAvailableMarkets(url);
 
-        case "/health":
+        case "/health": {
+          // Real health check — ping DB
+          let dbOk = false;
+          try {
+            await getDb()`SELECT 1`;
+            dbOk = true;
+          } catch { /* db unreachable */ }
+
+          if (!dbOk) {
+            return jsonResponse({ status: "unhealthy", database: "unreachable", timestamp: new Date().toISOString() }, 503);
+          }
           return jsonResponse({ status: "ok", timestamp: new Date().toISOString() });
+        }
 
         case "/status": {
           let activeCount = 0;
           try {
             activeCount = (await getAllActivePositions()).length;
           } catch { /* fallback to 0 */ }
+
+          let dbStatus = "unknown";
+          try {
+            await getDb()`SELECT 1`;
+            dbStatus = "ok";
+          } catch {
+            dbStatus = "unreachable";
+          }
+
+          let acpStatus = "unknown";
+          try {
+            acpStatus = (await checkAcpHealth()) ? "connected" : "disconnected";
+          } catch {
+            acpStatus = "error";
+          }
+
           return jsonResponse({
             agent: "HedgeFi",
-            version: "1.0.0-hackathon",
-            status: "operational",
+            version: "1.0.0",
+            status: dbStatus === "ok" ? "operational" : "degraded",
             model: "insurance",
-            services: { acp: "connected", limitless: "ready", database: "ok" },
+            services: { acp: acpStatus, limitless: "ready", database: dbStatus },
             activePositions: activeCount,
+            queue: jobQueue.getStats(),
             timestamp: new Date().toISOString(),
           });
         }
@@ -295,4 +326,6 @@ export function startResourceServer(): void {
   log.info("  GET /resources/market?marketId=<slug>");
   log.info("  GET /resources/available-markets?asset=ETH|BTC|all&timeframe=hourly|daily|weekly|all");
   log.info("  GET /health");
+
+  return server;
 }

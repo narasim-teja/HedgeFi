@@ -27,8 +27,14 @@ import {
   validateCloseHedgeReq,
 } from "./validation.ts";
 import { withBuyerLock } from "../utils/job-lock.ts";
+import { JobQueue } from "../utils/job-queue.ts";
+import { MAX_CONCURRENT_JOBS, MAX_QUEUE_SIZE } from "../utils/constants.ts";
 
 const log = createLogger("handler");
+
+// Global job queue — limits concurrent job processing across all buyers.
+// Works alongside per-buyer lock (job-lock.ts) for fund-transfer serialization.
+export const jobQueue = new JobQueue(MAX_CONCURRENT_JOBS, MAX_QUEUE_SIZE);
 
 /** Small delay to let UserOperation nonces settle on the RPC proxy. */
 function settleDelay(ms: number = 2000): Promise<void> {
@@ -69,11 +75,49 @@ export async function handleNewTask(
   }
   processingJobs.add(key);
 
+  // Safety cap: prevent unbounded dedup set growth under extreme load
+  if (processingJobs.size > 1000) {
+    log.warn(`Processing dedup set reached ${processingJobs.size} entries, clearing stale entries`);
+    processingJobs.clear();
+    processingJobs.add(key);
+  }
+
   log.info(`Dispatching job #${job.id}`, {
     name: jobName,
     phase: jobPhase,
     memoToSignId: memoToSign?.id,
+    queueStats: jobQueue.getStats(),
   });
+
+  // Route through the concurrency-controlled job queue.
+  // If queue is full, reject with backpressure signal.
+  const enqueued = jobQueue.enqueue(String(job.id), async () => {
+    await processJob(job, memoToSign);
+  });
+
+  if (!enqueued) {
+    log.warn(`Job #${job.id}: agent queue full, rejecting with backpressure`);
+    try {
+      await job.reject("Agent is currently at capacity. Please try again in a few minutes.");
+    } catch (err) {
+      log.error(`Failed to reject overloaded job #${job.id}`, err);
+    }
+    // Clean up dedup entry immediately since we're not processing
+    processingJobs.delete(key);
+    return;
+  }
+}
+
+/**
+ * Core job processing logic, executed within the JobQueue concurrency pool.
+ */
+async function processJob(
+  job: AcpJob,
+  memoToSign?: AcpMemo
+): Promise<void> {
+  const jobName = job.name as JobName | undefined;
+  const jobPhase = job.phase;
+  const key = jobKey(job.id, jobPhase);
 
   try {
 

@@ -1,4 +1,4 @@
-import { sql } from "./schema.ts";
+import { getDb } from "./connection.ts";
 import { createLogger } from "../utils/logger.ts";
 import type { DbPosition, CreatePositionParams, ClosingData } from "../utils/types.ts";
 
@@ -30,7 +30,7 @@ function normalizePositions(rows: Record<string, unknown>[]): DbPosition[] {
 export async function createPosition(params: CreatePositionParams): Promise<string> {
   const id = `pos_${crypto.randomUUID()}`;
 
-  await sql`
+  await getDb()`
     INSERT INTO positions (id, job_id, buyer_address, market_slug, market_title, token_id, side, action, shares, entry_price, total_cost_usdc, order_id, status, expiry, venue_exchange)
     VALUES (${id}, ${params.jobId}, ${params.buyerAddress}, ${params.marketSlug}, ${params.marketTitle}, ${params.tokenId}, ${params.side}, ${params.action}, ${params.shares}, ${params.entryPrice}, ${params.totalCostUsdc}, ${params.orderId}, 'active', ${params.expiry}, ${params.venueExchange})
   `;
@@ -43,7 +43,7 @@ export async function createPosition(params: CreatePositionParams): Promise<stri
  * Get all active positions for a specific buyer.
  */
 export async function getActivePositions(buyerAddress: string): Promise<DbPosition[]> {
-  const rows = await sql`
+  const rows = await getDb()`
     SELECT * FROM positions WHERE buyer_address = ${buyerAddress} AND status = 'active' ORDER BY created_at DESC
   `;
   return normalizePositions(rows as Record<string, unknown>[]);
@@ -53,7 +53,7 @@ export async function getActivePositions(buyerAddress: string): Promise<DbPositi
  * Get all active positions across all buyers.
  */
 export async function getAllActivePositions(): Promise<DbPosition[]> {
-  const rows = await sql`
+  const rows = await getDb()`
     SELECT * FROM positions WHERE status = 'active' ORDER BY created_at DESC
   `;
   return normalizePositions(rows as Record<string, unknown>[]);
@@ -63,7 +63,7 @@ export async function getAllActivePositions(): Promise<DbPosition[]> {
  * Get a position by ID.
  */
 export async function getPosition(positionId: string): Promise<DbPosition | null> {
-  const rows = await sql`SELECT * FROM positions WHERE id = ${positionId}`;
+  const rows = await getDb()`SELECT * FROM positions WHERE id = ${positionId}`;
   return normalizePosition(rows[0] as Record<string, unknown> | undefined);
 }
 
@@ -76,11 +76,11 @@ export async function updatePositionStatus(
   closingData?: ClosingData
 ): Promise<void> {
   if (closingData) {
-    await sql`
+    await getDb()`
       UPDATE positions SET status = ${status}, closed_at = NOW(), close_price = ${closingData.closePrice}, realized_pnl = ${closingData.realizedPnl} WHERE id = ${positionId}
     `;
   } else {
-    await sql`UPDATE positions SET status = ${status} WHERE id = ${positionId}`;
+    await getDb()`UPDATE positions SET status = ${status} WHERE id = ${positionId}`;
   }
 
   log.info(`Updated position ${positionId} → ${status}`);
@@ -90,7 +90,7 @@ export async function updatePositionStatus(
  * Get positions for a specific market.
  */
 export async function getPositionsForMarket(marketSlug: string): Promise<DbPosition[]> {
-  const rows = await sql`
+  const rows = await getDb()`
     SELECT * FROM positions WHERE market_slug = ${marketSlug} ORDER BY created_at DESC
   `;
   return normalizePositions(rows as Record<string, unknown>[]);
@@ -100,7 +100,7 @@ export async function getPositionsForMarket(marketSlug: string): Promise<DbPosit
  * Get historical (closed/resolved) positions for a specific buyer.
  */
 export async function getHistoricalPositions(buyerAddress: string): Promise<DbPosition[]> {
-  const rows = await sql`
+  const rows = await getDb()`
     SELECT * FROM positions WHERE buyer_address = ${buyerAddress} AND status != 'active' ORDER BY closed_at DESC
   `;
   return normalizePositions(rows as Record<string, unknown>[]);
@@ -123,7 +123,7 @@ export async function recordOrder(params: {
 }): Promise<void> {
   const id = `ord_${crypto.randomUUID()}`;
 
-  await sql`
+  await getDb()`
     INSERT INTO order_history (id, position_id, order_type, market_slug, side, maker_amount, taker_amount, price, filled_size, order_id, status)
     VALUES (${id}, ${params.positionId}, ${params.orderType}, ${params.marketSlug}, ${params.side}, ${params.makerAmount}, ${params.takerAmount}, ${params.price}, ${params.filledSize}, ${params.orderId}, ${params.status})
   `;

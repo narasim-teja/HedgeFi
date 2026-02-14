@@ -38,11 +38,23 @@ function getPublicClient() {
 }
 
 // =============================================
-// Approval cache (per exchange address)
+// Approval cache with TTL (per exchange address)
 // =============================================
 
-const usdcApproved = new Set<string>();
-const ctApproved = new Set<string>();
+const APPROVAL_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+const usdcApproved = new Map<string, number>();
+const ctApproved = new Map<string, number>();
+
+function isCacheValid(cache: Map<string, number>, key: string): boolean {
+  const ts = cache.get(key);
+  if (ts === undefined) return false;
+  if (Date.now() - ts > APPROVAL_CACHE_TTL_MS) {
+    cache.delete(key);
+    return false;
+  }
+  return true;
+}
 
 // =============================================
 // USDC Approval (ERC-20)
@@ -53,7 +65,7 @@ const ctApproved = new Set<string>();
  * Checks allowance first, only sends tx if needed.
  */
 export async function ensureUsdcApproval(exchangeAddress: string): Promise<void> {
-  if (usdcApproved.has(exchangeAddress)) return;
+  if (isCacheValid(usdcApproved, exchangeAddress)) return;
 
   const publicClient = getPublicClient();
   const account = getAccount();
@@ -71,7 +83,7 @@ export async function ensureUsdcApproval(exchangeAddress: string): Promise<void>
     // If allowance is > 1000 USDC (1e9 in 6-decimal), skip approval
     if (allowance > 1_000_000_000n) {
       log.debug(`USDC already approved for ${exchangeAddress}`);
-      usdcApproved.add(exchangeAddress);
+      usdcApproved.set(exchangeAddress, Date.now());
       return;
     }
   } catch (err) {
@@ -95,7 +107,7 @@ export async function ensureUsdcApproval(exchangeAddress: string): Promise<void>
   await publicClientForReceipt.waitForTransactionReceipt({ hash });
   log.info("USDC approval confirmed");
 
-  usdcApproved.add(exchangeAddress);
+  usdcApproved.set(exchangeAddress, Date.now());
 }
 
 /**
@@ -108,7 +120,7 @@ export async function ensureCtApproval(
   exchangeAddress: string
 ): Promise<void> {
   const cacheKey = `${ctContractAddress}:${exchangeAddress}`;
-  if (ctApproved.has(cacheKey)) return;
+  if (isCacheValid(ctApproved, cacheKey)) return;
 
   const publicClient = getPublicClient();
   const account = getAccount();
@@ -123,7 +135,7 @@ export async function ensureCtApproval(
 
     if (isApproved) {
       log.debug(`CT already approved for ${exchangeAddress}`);
-      ctApproved.add(cacheKey);
+      ctApproved.set(cacheKey, Date.now());
       return;
     }
   } catch (err) {
@@ -146,5 +158,5 @@ export async function ensureCtApproval(
   await publicClientForReceipt.waitForTransactionReceipt({ hash });
   log.info("CT approval confirmed");
 
-  ctApproved.add(cacheKey);
+  ctApproved.set(cacheKey, Date.now());
 }

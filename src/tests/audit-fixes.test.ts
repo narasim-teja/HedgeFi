@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { sql } from "../db/schema.ts";
+import { getDb } from "../db/connection.ts";
 
 // =============================================
 // 1. Per-buyer concurrency lock
@@ -108,13 +108,13 @@ describe("Position isolation (security fix)", () => {
   const buyerB = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 
   beforeEach(async () => {
-    await sql`DELETE FROM order_history WHERE position_id IN (SELECT id FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB}))`;
-    await sql`DELETE FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB})`;
+    await getDb()`DELETE FROM order_history WHERE position_id IN (SELECT id FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB}))`;
+    await getDb()`DELETE FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB})`;
   });
 
   afterEach(async () => {
-    await sql`DELETE FROM order_history WHERE position_id IN (SELECT id FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB}))`;
-    await sql`DELETE FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB})`;
+    await getDb()`DELETE FROM order_history WHERE position_id IN (SELECT id FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB}))`;
+    await getDb()`DELETE FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB})`;
   });
 
   async function createTestPosition(buyerAddress: string, slug: string) {
@@ -189,7 +189,7 @@ describe("Position isolation (security fix)", () => {
     });
 
     // Query the order directly to check ID format
-    const rows = await sql`SELECT id FROM order_history WHERE position_id = ${posId}`;
+    const rows = await getDb()`SELECT id FROM order_history WHERE position_id = ${posId}`;
     const order = rows[0] as { id: string } | undefined;
     expect(order).not.toBeUndefined();
     expect(order!.id).toMatch(/^ord_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
@@ -215,11 +215,11 @@ import {
 
 describe("recoverStuckJobs", () => {
   beforeEach(async () => {
-    await sql`DELETE FROM job_state WHERE job_id LIKE 'test-stuck-%'`;
+    await getDb()`DELETE FROM job_state WHERE job_id LIKE 'test-stuck-%'`;
   });
 
   afterEach(async () => {
-    await sql`DELETE FROM job_state WHERE job_id LIKE 'test-stuck-%'`;
+    await getDb()`DELETE FROM job_state WHERE job_id LIKE 'test-stuck-%'`;
   });
 
   test("marks stuck 'executing' jobs as failed", async () => {
@@ -228,7 +228,7 @@ describe("recoverStuckJobs", () => {
     await upsertJobState("test-stuck-1", { jobName: "execute_hedge", phase: "executing" });
 
     // Manually backdate started_at to 20 minutes ago
-    await sql`UPDATE job_state SET started_at = NOW() - INTERVAL '20 minutes' WHERE job_id = ${"test-stuck-1"}`;
+    await getDb()`UPDATE job_state SET started_at = NOW() - INTERVAL '20 minutes' WHERE job_id = ${"test-stuck-1"}`;
 
     const recovered = await recoverStuckJobs(10);
     expect(recovered).toBeGreaterThanOrEqual(1);
@@ -469,7 +469,7 @@ describe("RateLimiter (audit)", () => {
 
 describe("Schema: started_at column exists", () => {
   test("job_state table has started_at column", async () => {
-    const info = await sql`SELECT column_name as name FROM information_schema.columns WHERE table_name = 'job_state'`;
+    const info = await getDb()`SELECT column_name as name FROM information_schema.columns WHERE table_name = 'job_state'`;
     const columnNames = (info as Array<{ name: string }>).map((c) => c.name);
     expect(columnNames).toContain("started_at");
   });

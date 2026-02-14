@@ -257,6 +257,19 @@ export const MAX_FOK_SLIPPAGE_PCT = 0.05;
 /** Default fee rate in basis points (fallback if profile fetch fails) */
 export const DEFAULT_FEE_RATE_BPS = 300;
 
+// =============================================
+// Production Scalability (Job Queue)
+// =============================================
+
+/** Maximum number of ACP jobs executing simultaneously across all buyers */
+export const MAX_CONCURRENT_JOBS = 5;
+
+/** Maximum pending jobs in queue before backpressure rejects new requests */
+export const MAX_QUEUE_SIZE = 20;
+
+/** Minimum ETH balance required for gas (approval txs, etc.) */
+export const MIN_ETH_FOR_GAS = 0.0005;
+
 /** EIP-712 Order type definition for Limitless CTF Exchange */
 export const EIP712_ORDER_TYPES = {
   Order: [

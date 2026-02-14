@@ -10,6 +10,8 @@ const log = createLogger("limitless-auth");
 // =============================================
 
 let sessionCookie: string | null = null;
+let sessionTimestamp = 0;
+const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
 let userProfile: LimitlessUserProfile | null = null;
 
 // =============================================
@@ -81,10 +83,12 @@ export async function authenticateAgent(): Promise<void> {
     const match = setCookieHeader.match(/limitless_session=([^;]+)/);
     if (match) {
       sessionCookie = match[1]!;
+      sessionTimestamp = Date.now();
       log.info("Session cookie obtained");
     } else {
       // Store the full set-cookie as fallback
       sessionCookie = setCookieHeader.split(";")[0] ?? null;
+      sessionTimestamp = Date.now();
       log.warn("Could not parse limitless_session cookie, using raw cookie");
     }
   } else {
@@ -144,6 +148,9 @@ export function getUserProfile(): LimitlessUserProfile | null {
  * Ensure the agent is authenticated. Calls authenticateAgent() if needed.
  */
 export async function ensureAuthenticated(): Promise<void> {
-  if (sessionCookie) return;
+  if (sessionCookie && (Date.now() - sessionTimestamp) < SESSION_TTL_MS) return;
+  if (sessionCookie) {
+    log.info("Session TTL expired, re-authenticating proactively");
+  }
   await authenticateAgent();
 }

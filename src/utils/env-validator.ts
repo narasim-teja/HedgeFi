@@ -56,4 +56,7 @@ export function validateEnvironment(): void {
   if (!process.env.GEMINI_API_KEY) {
     console.warn("  Warning: GEMINI_API_KEY not set — AI reasoning will use template fallbacks");
   }
+  if (!process.env.CORS_ALLOWED_ORIGIN) {
+    console.warn("  Warning: CORS_ALLOWED_ORIGIN not set — defaulting to '*' (unsafe for production)");
+  }
 }

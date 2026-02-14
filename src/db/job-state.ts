@@ -1,4 +1,4 @@
-import { sql } from "./schema.ts";
+import { getDb } from "./connection.ts";
 import { createLogger } from "../utils/logger.ts";
 import type { JobState, JobInternalPhase } from "../utils/types.ts";
 
@@ -24,7 +24,7 @@ function normalizeJobState(row: Record<string, unknown> | undefined): JobState |
  * Get the current state of a job by ID.
  */
 export async function getJobState(jobId: string): Promise<JobState | null> {
-  const rows = await sql`SELECT * FROM job_state WHERE job_id = ${jobId}`;
+  const rows = await getDb()`SELECT * FROM job_state WHERE job_id = ${jobId}`;
   return normalizeJobState(rows[0]);
 }
 
@@ -41,6 +41,7 @@ export async function upsertJobState(
 ): Promise<void> {
   const phase = data.phase ?? "initialized";
   const buyerAddress = data.buyerAddress ?? null;
+  const sql = getDb();
 
   await sql`
     INSERT INTO job_state (job_id, job_name, phase, buyer_address, started_at, created_at, updated_at)
@@ -67,7 +68,7 @@ export async function upsertJobState(
  * Mark a job's confirmation as sent and store the frozen plan payload.
  */
 export async function setConfirmationSent(jobId: string, payload: string): Promise<void> {
-  await sql`
+  await getDb()`
     UPDATE job_state
     SET confirmation_sent = 1,
         confirmation_payload = ${payload},
@@ -82,7 +83,7 @@ export async function setConfirmationSent(jobId: string, payload: string): Promi
  * Mark a job as confirmed by the buyer.
  */
 export async function setConfirmed(jobId: string): Promise<void> {
-  await sql`
+  await getDb()`
     UPDATE job_state SET phase = 'confirmed', updated_at = NOW() WHERE job_id = ${jobId}
   `;
   log.info(`Job ${jobId}: confirmed by buyer`);
@@ -92,7 +93,7 @@ export async function setConfirmed(jobId: string): Promise<void> {
  * Mark a job as delivered.
  */
 export async function setDelivered(jobId: string): Promise<void> {
-  await sql`
+  await getDb()`
     UPDATE job_state SET phase = 'delivered', updated_at = NOW() WHERE job_id = ${jobId}
   `;
 }
@@ -101,7 +102,7 @@ export async function setDelivered(jobId: string): Promise<void> {
  * Mark a job as failed.
  */
 export async function setFailed(jobId: string): Promise<void> {
-  await sql`
+  await getDb()`
     UPDATE job_state SET phase = 'failed', updated_at = NOW() WHERE job_id = ${jobId}
   `;
 }
@@ -110,7 +111,7 @@ export async function setFailed(jobId: string): Promise<void> {
  * Clean up old job state records to prevent DB bloat.
  */
 export async function cleanupOldJobs(olderThanDays: number): Promise<number> {
-  const deleted = await sql`
+  const deleted = await getDb()`
     DELETE FROM job_state
     WHERE created_at < NOW() - ${olderThanDays + " days"}::INTERVAL
     RETURNING job_id
@@ -126,7 +127,7 @@ export async function cleanupOldJobs(olderThanDays: number): Promise<number> {
  * Typically run once on agent startup to recover from crashes.
  */
 export async function recoverStuckJobs(stuckMinutes: number = 10): Promise<number> {
-  const recovered = await sql`
+  const recovered = await getDb()`
     UPDATE job_state
     SET phase = 'failed', updated_at = NOW()
     WHERE phase = 'executing'

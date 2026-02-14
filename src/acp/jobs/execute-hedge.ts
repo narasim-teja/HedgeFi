@@ -3,7 +3,7 @@ import { Fare, FareAmount } from "@virtuals-protocol/acp-node";
 import { createPublicClient, http } from "viem";
 import { base } from "viem/chains";
 import { createLogger } from "../../utils/logger.ts";
-import { STABLECOIN_SYMBOLS, USDC_BASE, ERC20_ABI, CHAIN_CONFIG, BASE_CHAIN_ID, MAX_HEDGE_BUDGET_USD } from "../../utils/constants.ts";
+import { STABLECOIN_SYMBOLS, USDC_BASE, ERC20_ABI, CHAIN_CONFIG, BASE_CHAIN_ID, MAX_HEDGE_BUDGET_USD, MIN_ETH_FOR_GAS } from "../../utils/constants.ts";
 
 /**
  * Ensure the Fare object has chainId set (required by deliverPayable).
@@ -67,6 +67,22 @@ async function getAgentUsdcBalance(): Promise<number> {
   });
 
   return Number(raw) / 1e6; // USDC has 6 decimals
+}
+
+async function getAgentEthBalance(): Promise<number> {
+  const walletAddress = process.env.HEDGEFI_WALLET_ADDRESS;
+  if (!walletAddress) return 0;
+
+  const client = createPublicClient({
+    chain: base,
+    transport: http(CHAIN_CONFIG.base.rpcUrl),
+  });
+
+  const raw = await client.getBalance({
+    address: walletAddress as `0x${string}`,
+  });
+
+  return Number(raw) / 1e18; // ETH has 18 decimals
 }
 
 // =============================================
@@ -239,6 +255,45 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
     };
   }
 
+  // Pre-flight agent liquidity check — reject BEFORE accept() so buyer never pays
+  try {
+    const agentBalance = await getAgentUsdcBalance();
+    jlog.info(`Pre-flight agent USDC balance: $${agentBalance.toFixed(2)}, requested budget: $${req.hedge_budget_usdc}`);
+    if (agentBalance < req.hedge_budget_usdc) {
+      jlog.warn(`Agent liquidity insufficient ($${agentBalance.toFixed(2)}) for budget ($${req.hedge_budget_usdc})`);
+      await setFailed(String(job.id));
+      return {
+        type: "error",
+        message: `Agent liquidity insufficient ($${agentBalance.toFixed(2)} available) for budget ($${req.hedge_budget_usdc}). Try again later or reduce budget.`,
+      };
+    }
+  } catch (balErr) {
+    // Fail safe — do NOT accept the job if we can't verify our balance
+    jlog.error("Failed to check agent USDC balance during pre-flight", balErr);
+    await setFailed(String(job.id));
+    return {
+      type: "error",
+      message: "Unable to verify agent liquidity. Please try again shortly.",
+    };
+  }
+
+  // Pre-flight gas check — agent needs ETH for approval transactions
+  try {
+    const ethBalance = await getAgentEthBalance();
+    jlog.info(`Pre-flight agent ETH balance: ${ethBalance.toFixed(6)} ETH`);
+    if (ethBalance < MIN_ETH_FOR_GAS) {
+      jlog.warn(`Agent ETH balance too low for gas (${ethBalance.toFixed(6)} ETH < ${MIN_ETH_FOR_GAS})`);
+      await setFailed(String(job.id));
+      return {
+        type: "error",
+        message: "Agent gas balance too low to execute transactions. Please try again later.",
+      };
+    }
+  } catch (gasErr) {
+    jlog.warn("Failed to check agent ETH balance, proceeding (gas check non-critical)", gasErr);
+    // ETH gas check is best-effort — don't block on this since approval may already be cached
+  }
+
   const timeframe = req.market_timeframe ?? "all";
 
   try {
@@ -376,6 +431,27 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
 
   await upsertJobState(String(job.id), { jobName: "execute_hedge", phase: "executing" });
 
+  // Market expiry re-check: ensure at least some markets haven't expired since Phase A
+  const EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+  const nowMs = Date.now();
+  const viableMarkets = plan.market_details.filter((d) => {
+    const expiryMs = new Date(d.expiry).getTime();
+    return expiryMs > nowMs + EXPIRY_BUFFER_MS;
+  });
+
+  if (viableMarkets.length === 0) {
+    jlog.warn("All recommended markets expired since Phase A plan was created");
+    await rejectWithRefund(job, jlog,
+      "All recommended markets expired since your plan was created. Full refund issued. Please submit a new request.",
+      req.hedge_budget_usdc);
+    await setFailed(String(job.id));
+    return;
+  }
+
+  if (viableMarkets.length < plan.market_details.length) {
+    jlog.info(`${plan.market_details.length - viableMarkets.length} market(s) expired since Phase A, ${viableMarkets.length} still viable`);
+  }
+
   try {
     // Pre-check: verify agent wallet has enough USDC to cover the budget
     try {
@@ -392,7 +468,12 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
         return;
       }
     } catch (balErr) {
-      jlog.warn("Failed to check agent balance, proceeding anyway", balErr);
+      jlog.error("Failed to check agent balance in Phase B", balErr);
+      await rejectWithRefund(job, jlog,
+        "Unable to verify agent liquidity. Full refund issued. Please try again.",
+        req.hedge_budget_usdc);
+      await setFailed(String(job.id));
+      return;
     }
 
     const { exposure, recommendations } = plan;
