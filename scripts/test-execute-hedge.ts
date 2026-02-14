@@ -194,6 +194,7 @@ async function main() {
     chain: "base",
     risk_tolerance: "moderate",
     hedge_budget_usdc: 1,
+    market_timeframe: "daily", // "hourly" | "daily" | "weekly" | "all"
   };
 
   log("Requirement:", requirement);

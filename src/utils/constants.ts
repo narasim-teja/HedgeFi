@@ -203,6 +203,17 @@ export const RISK_TOLERANCE_DROP_TARGETS: Record<string, number[]> = {
   aggressive: [0.10, 0.20],
 };
 
+// =============================================
+// Market timeframe boundaries (hours-to-expiry)
+// =============================================
+
+export const TIMEFRAME_HOUR_BOUNDS: Record<string, { min: number; max: number }> = {
+  hourly:  { min: 0,   max: 2 },
+  daily:   { min: 2,   max: 26 },
+  weekly:  { min: 26,  max: 168 },
+  all:     { min: 0,   max: Infinity },
+};
+
 /** Max percentage of budget for a single market */
 export const MAX_SINGLE_MARKET_ALLOCATION = 0.50;
 

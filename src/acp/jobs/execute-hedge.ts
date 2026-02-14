@@ -140,6 +140,9 @@ function formatConfirmationMessage(plan: HedgePlanConfirmation): string {
   lines.push(`Portfolio: $${formatUsd(plan.exposure.total_value_usd)} (${plan.exposure.top_exposure})`);
   lines.push(`Concentration Risk: ${plan.exposure.concentration_risk}`);
   lines.push(`Budget: $${formatUsd(plan.budget)} | Risk Tolerance: ${plan.risk_tolerance}`);
+  if (plan.market_timeframe && plan.market_timeframe !== "all") {
+    lines.push(`Market Timeframe: ${plan.market_timeframe}`);
+  }
   lines.push("");
   lines.push("Proposed Orders:");
 
@@ -236,6 +239,8 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
     };
   }
 
+  const timeframe = req.market_timeframe ?? "all";
+
   try {
     // Step 1: Read real wallet exposure
     const tWallet = jlog.time("Read wallet balances");
@@ -257,7 +262,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
     const tMarkets = jlog.time("Limitless market scan");
     let scoredMarkets: ScoredLimitlessMarket[] = [];
     try {
-      scoredMarkets = await findHedgingMarkets(exposure);
+      scoredMarkets = await findHedgingMarkets(exposure, timeframe);
     } catch (err) {
       jlog.warn("Failed to fetch Limitless markets", err);
     }
@@ -268,8 +273,11 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
       jlog.info("No hedging markets found");
       setFailed(String(job.id));
       const topNonStable = exposure.tokens.find((t) => !STABLECOIN_SYMBOLS.has(t.symbol));
+      const timeframeNote = timeframe !== "all"
+        ? ` No ${timeframe} markets are currently available. Try a different timeframe or "all".`
+        : "";
       const reasoning = generateEdgeCaseMessage("no_markets_found", { topAsset: topNonStable?.symbol ?? "your holdings" });
-      return { type: "error", message: reasoning };
+      return { type: "error", message: reasoning + timeframeNote };
     }
 
     const { recommendations: rawRecommendations, diagnostics } = buildHedgeRecommendations(
@@ -316,6 +324,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
       coverage_ratio: coverageRatio,
       budget: req.hedge_budget_usdc,
       risk_tolerance: req.risk_tolerance,
+      market_timeframe: timeframe,
       market_details: marketDetails,
     };
 

@@ -7,7 +7,7 @@ import {
 } from "../db/positions.ts";
 import { getMarketsForAsset } from "../limitless/markets.ts";
 import { fetchMarketBySlug } from "../limitless/client.ts";
-import type { DbPosition, ScoredLimitlessMarket } from "../utils/types.ts";
+import type { DbPosition, ScoredLimitlessMarket, MarketTimeframe } from "../utils/types.ts";
 
 const log = createLogger("resource-server");
 
@@ -201,11 +201,19 @@ function formatMarketForResource(m: ScoredLimitlessMarket) {
 
 async function handleAvailableMarkets(url: URL): Promise<Response> {
   const asset = url.searchParams.get("asset") ?? "all";
+  const timeframeParam = url.searchParams.get("timeframe") ?? "all";
+
+  const validTimeframes = ["hourly", "daily", "weekly", "all"];
+  if (!validTimeframes.includes(timeframeParam)) {
+    return errorResponse(`Invalid timeframe: "${timeframeParam}". Must be one of: ${validTimeframes.join(", ")}`);
+  }
+  const timeframe = timeframeParam as MarketTimeframe;
 
   try {
-    const markets = await getMarketsForAsset(asset);
+    const markets = await getMarketsForAsset(asset, timeframe);
     return jsonResponse({
       asset,
+      timeframe,
       markets: markets.map(formatMarketForResource),
       lastUpdatedAt: new Date().toISOString(),
     });
@@ -285,6 +293,6 @@ export function startResourceServer(): void {
   log.info("  GET /resources/active-positions?clientAddress=0x...");
   log.info("  GET /resources/historical-positions?clientAddress=0x...");
   log.info("  GET /resources/market?marketId=<slug>");
-  log.info("  GET /resources/available-markets?asset=ETH|BTC|all");
+  log.info("  GET /resources/available-markets?asset=ETH|BTC|all&timeframe=hourly|daily|weekly|all");
   log.info("  GET /health");
 }

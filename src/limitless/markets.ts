@@ -2,6 +2,7 @@ import { createLogger } from "../utils/logger.ts";
 import {
   SYMBOL_TO_LIMITLESS_TICKER,
   MIN_MARKET_LIQUIDITY_USD,
+  TIMEFRAME_HOUR_BOUNDS,
 } from "../utils/constants.ts";
 import {
   fetchActiveMarkets,
@@ -13,6 +14,7 @@ import type {
   LimitlessMarketSlug,
   ScoredLimitlessMarket,
   PortfolioExposure,
+  MarketTimeframe,
 } from "../utils/types.ts";
 
 const log = createLogger("limitless-markets");
@@ -202,6 +204,31 @@ function computeHedgeScore(inputs: ScoreInputs): number {
 }
 
 // =============================================
+// Timeframe filtering
+// =============================================
+
+/**
+ * Filter scored markets by timeframe preference.
+ * Returns only markets whose hours-to-expiry falls within the specified bucket.
+ * "all" returns everything (no filtering).
+ */
+export function filterByTimeframe(
+  markets: ScoredLimitlessMarket[],
+  timeframe: MarketTimeframe
+): ScoredLimitlessMarket[] {
+  if (timeframe === "all") return markets;
+
+  const bounds = TIMEFRAME_HOUR_BOUNDS[timeframe];
+  if (!bounds) return markets;
+
+  const now = Date.now();
+  return markets.filter((m) => {
+    const hoursToExpiry = (m.expirationDate.getTime() - now) / (1000 * 60 * 60);
+    return hoursToExpiry > bounds.min && hoursToExpiry <= bounds.max;
+  });
+}
+
+// =============================================
 // Main scanning functions
 // =============================================
 
@@ -210,7 +237,8 @@ function computeHedgeScore(inputs: ScoreInputs): number {
  * Combines active market browsing with targeted search.
  */
 export async function findHedgingMarkets(
-  exposure: PortfolioExposure
+  exposure: PortfolioExposure,
+  timeframe: MarketTimeframe = "all"
 ): Promise<ScoredLimitlessMarket[]> {
   const hedgeableTickers = getHedgeableTickers(exposure);
 
@@ -269,14 +297,22 @@ export async function findHedgingMarkets(
     }
   }
 
-  scored.sort((a, b) => b.hedgeScore - a.hedgeScore);
+  // Apply timeframe filter before sorting
+  const filtered = filterByTimeframe(scored, timeframe);
 
-  log.info(`Found ${scored.length} hedging-relevant markets`, {
-    tickers: [...new Set(scored.map((m) => m.ticker))],
-    topScore: scored[0]?.hedgeScore,
+  if (scored.length > 0 && filtered.length === 0) {
+    log.info(`All ${scored.length} markets filtered out by timeframe "${timeframe}"`);
+  }
+
+  filtered.sort((a, b) => b.hedgeScore - a.hedgeScore);
+
+  log.info(`Found ${filtered.length} hedging-relevant markets (timeframe: ${timeframe})`, {
+    tickers: [...new Set(filtered.map((m) => m.ticker))],
+    topScore: filtered[0]?.hedgeScore,
+    filteredOut: scored.length - filtered.length,
   });
 
-  return scored;
+  return filtered;
 }
 
 /**
@@ -302,7 +338,8 @@ function getHedgeableTickers(exposure: PortfolioExposure): string[] {
  * Get markets for a specific asset (for the available_markets resource).
  */
 export async function getMarketsForAsset(
-  asset: string
+  asset: string,
+  timeframe: MarketTimeframe = "all"
 ): Promise<ScoredLimitlessMarket[]> {
   const [activeMarkets, slugs] = await Promise.all([
     fetchActiveMarkets(),
@@ -326,6 +363,7 @@ export async function getMarketsForAsset(
     }
   }
 
-  scored.sort((a, b) => b.hedgeScore - a.hedgeScore);
-  return scored;
+  const timeframeFiltered = filterByTimeframe(scored, timeframe);
+  timeframeFiltered.sort((a, b) => b.hedgeScore - a.hedgeScore);
+  return timeframeFiltered;
 }

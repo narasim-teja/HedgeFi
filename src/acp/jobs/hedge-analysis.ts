@@ -114,10 +114,11 @@ export async function handleHedgeAnalysis(job: AcpJob): Promise<void> {
     }
 
     // Step 4: Scan Limitless markets for hedging opportunities
+    const timeframe = req.market_timeframe ?? "all";
     const tMarkets = log.time("Limitless market scan");
     let scoredMarkets: ScoredLimitlessMarket[] = [];
     try {
-      scoredMarkets = await findHedgingMarkets(exposure);
+      scoredMarkets = await findHedgingMarkets(exposure, timeframe);
     } catch (err) {
       log.warn("Failed to fetch Limitless markets, continuing without", err);
     }

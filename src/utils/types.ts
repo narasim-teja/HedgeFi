@@ -2,6 +2,9 @@
 // Shared analysis result type
 // =============================================
 
+/** Market timeframe preference for filtering prediction markets by expiry window. */
+export type MarketTimeframe = "hourly" | "daily" | "weekly" | "all";
+
 /** Returned by analysis/preview functions called during REQUEST phase. */
 export type AnalysisResult =
   | { type: "plan"; message: string }   // Success: send as payable requirement
@@ -16,6 +19,7 @@ export interface HedgeAnalysisRequirement {
   chain: "base" | "ethereum" | "arbitrum";
   risk_tolerance: "conservative" | "moderate" | "aggressive";
   hedge_budget: number;
+  market_timeframe?: MarketTimeframe;
 }
 
 export interface TokenExposure {
@@ -60,6 +64,7 @@ export interface ExecuteHedgeRequirement {
   chain: "base" | "ethereum" | "arbitrum";
   risk_tolerance: "conservative" | "moderate" | "aggressive";
   hedge_budget_usdc: number;
+  market_timeframe?: MarketTimeframe;
 }
 
 export interface HedgePlaced {
@@ -415,6 +420,7 @@ export interface HedgePlanConfirmation {
   coverage_ratio: string;
   budget: number;
   risk_tolerance: string;
+  market_timeframe: MarketTimeframe;
   market_details: Array<{
     market_question: string;
     action: "BUY_YES" | "BUY_NO";

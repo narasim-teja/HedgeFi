@@ -44,6 +44,17 @@ export function validateHedgeBudget(budget: unknown): ValidationResult {
   return { valid: true };
 }
 
+export function validateMarketTimeframe(timeframe: unknown): ValidationResult {
+  if (timeframe === undefined || timeframe === null) {
+    return { valid: true };
+  }
+  const VALID = ["hourly", "daily", "weekly", "all"];
+  if (typeof timeframe !== "string" || !VALID.includes(timeframe)) {
+    return { valid: false, error: `Invalid market_timeframe: "${timeframe}". Must be one of: ${VALID.join(", ")}` };
+  }
+  return { valid: true };
+}
+
 export function validateCloseHedgeReq(req: unknown): ValidationResult {
   if (!req || typeof req !== "object") {
     return { valid: false, error: "close_hedge requirement must be an object" };
@@ -63,6 +74,7 @@ export function validateHedgeAnalysisReq(req: Record<string, unknown>): Validati
     validateChain(req.chain),
     validateRiskTolerance(req.risk_tolerance),
     validateHedgeBudget(req.hedge_budget),
+    validateMarketTimeframe(req.market_timeframe),
   ]) {
     if (!check.valid) return check;
   }
@@ -75,6 +87,7 @@ export function validateExecuteHedgeReq(req: Record<string, unknown>): Validatio
     validateChain(req.chain),
     validateRiskTolerance(req.risk_tolerance),
     validateHedgeBudget(req.hedge_budget_usdc),
+    validateMarketTimeframe(req.market_timeframe),
   ]) {
     if (!check.valid) return check;
   }
