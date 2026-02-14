@@ -30,9 +30,14 @@ export const ERC20_ABI = [
 // =============================================
 export type SupportedChain = "base" | "ethereum" | "arbitrum";
 
+const alchemyKey = process.env.ALCHEMY_API_KEY;
+const alchemyBaseUrl = alchemyKey
+  ? `https://base-mainnet.g.alchemy.com/v2/${alchemyKey}`
+  : undefined;
+
 export const CHAIN_CONFIG: Record<SupportedChain, { rpcUrl: string; chainId: number }> = {
   base: {
-    rpcUrl: process.env.BASE_RPC_URL || "https://mainnet.base.org",
+    rpcUrl: process.env.BASE_RPC_URL || alchemyBaseUrl || "https://mainnet.base.org",
     chainId: 8453,
   },
   ethereum: {

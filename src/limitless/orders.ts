@@ -313,6 +313,12 @@ export async function placeHedgeOrder(params: PlaceOrderParams): Promise<PlaceOr
     maxRetries: 2,
     baseDelayMs: 1000,
     maxDelayMs: 5000,
+    shouldRetry: (err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Don't retry permanent failures — market resolved or insufficient balance
+      if (msg.includes("already been resolved") || msg.includes("Insufficient")) return false;
+      return true;
+    },
   });
 
   // 7. Parse result

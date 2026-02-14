@@ -1,4 +1,13 @@
 // =============================================
+// Shared analysis result type
+// =============================================
+
+/** Returned by analysis/preview functions called during REQUEST phase. */
+export type AnalysisResult =
+  | { type: "plan"; message: string }   // Success: send as payable requirement
+  | { type: "error"; message: string }; // Failure: send as non-payable requirement
+
+// =============================================
 // hedge_analysis types
 // =============================================
 

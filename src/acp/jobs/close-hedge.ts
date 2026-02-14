@@ -1,7 +1,17 @@
 import type { AcpJob } from "@virtuals-protocol/acp-node";
-import { FareAmount } from "@virtuals-protocol/acp-node";
+import { Fare, FareAmount } from "@virtuals-protocol/acp-node";
+import { BASE_CHAIN_ID } from "../../utils/constants.ts";
+
+/** Ensure Fare has chainId set (required by deliverPayable to avoid cross-chain routing). */
+function ensureFareChainId(fare: InstanceType<typeof Fare>): InstanceType<typeof Fare> {
+  if (!fare.chainId) {
+    return new Fare(fare.contractAddress, fare.decimals, BASE_CHAIN_ID);
+  }
+  return fare;
+}
 import { createLogger } from "../../utils/logger.ts";
 import type {
+  AnalysisResult,
   CloseHedgeRequirement,
   CloseHedgeDeliverable,
   PositionClosed,
@@ -126,11 +136,17 @@ function formatCloseConfirmationMessage(plan: ClosePlanConfirmation): string {
 // =============================================
 
 /**
- * Preview positions for closing. Returns the confirmation message text,
- * or null if there are no positions to close (job gets rejected).
+ * Preview positions for closing. Returns an AnalysisResult:
+ * - { type: "plan", message } for a valid close preview
+ * - { type: "error", message } when there are no positions to close
+ *
+ * IMPORTANT: This function NEVER calls job.reject() because it runs
+ * AFTER accept(). Calling reject() post-accept causes "Already signed"
+ * nonce conflicts on the Alchemy proxy. The caller handles the result.
+ *
  * Called during REQUEST phase so buyer sees the preview before paying.
  */
-export async function handleCloseHedgePreview(job: AcpJob): Promise<string | null> {
+export async function handleCloseHedgePreview(job: AcpJob): Promise<AnalysisResult> {
   const jlog = log.withJob(job.id);
   jlog.info("Phase A: Previewing positions for close");
 
@@ -147,11 +163,10 @@ export async function handleCloseHedgePreview(job: AcpJob): Promise<string | nul
     const buyerAddress = job.clientAddress ?? "unknown";
     const positions = resolvePositions(req, buyerAddress);
 
-    // No positions to close — reject (no payment needed)
+    // No positions to close
     if (positions.length === 0) {
-      jlog.info("No active positions to close, rejecting");
-      await job.reject("No active hedge positions were found to close. Positions may have already been closed or expired.");
-      return null;
+      jlog.info("No active positions to close");
+      return { type: "error", message: "No active hedge positions were found to close. Positions may have already been closed or expired." };
     }
 
     // Fetch current market prices for each position
@@ -199,15 +214,15 @@ export async function handleCloseHedgePreview(job: AcpJob): Promise<string | nul
     // Return the formatted preview text — caller will pass to createRequirement
     const confirmationMsg = formatCloseConfirmationMessage(plan);
     jlog.info("Close preview built, returning to caller");
-    return confirmationMsg;
+    return { type: "plan", message: confirmationMsg };
 
   } catch (err) {
     jlog.error("Failed during close hedge preview", err);
     setFailed(String(job.id));
-    await job.reject(
-      `Close hedge preview failed: ${err instanceof Error ? err.message : "Unknown error"}`
-    );
-    return null;
+    return {
+      type: "error",
+      message: `Close hedge preview failed: ${err instanceof Error ? err.message : "Unknown error"}`,
+    };
   }
 }
 
@@ -397,7 +412,7 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
 
     // Use deliverPayable to atomically deliver result + return funds when there are proceeds
     if (closedPositions.length > 0 && totalReturned > 0) {
-      const fareAmount = new FareAmount(totalReturned, job.baseFare);
+      const fareAmount = new FareAmount(totalReturned, ensureFareChainId(job.baseFare));
       await job.deliverPayable(JSON.stringify(deliverable), fareAmount);
       jlog.info(`Delivered with fund return ($${totalReturned.toFixed(2)})`);
     } else {
@@ -421,7 +436,7 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
     try {
       const payable = job.netPayableAmount;
       if (payable && payable > 0) {
-        const fareAmount = new FareAmount(payable, job.baseFare);
+        const fareAmount = new FareAmount(payable, ensureFareChainId(job.baseFare));
         await job.rejectPayable(
           `Close hedge failed: ${err instanceof Error ? err.message : "Unknown error"}`,
           fareAmount

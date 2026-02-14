@@ -1,10 +1,23 @@
 import type { AcpJob } from "@virtuals-protocol/acp-node";
-import { FareAmount } from "@virtuals-protocol/acp-node";
+import { Fare, FareAmount } from "@virtuals-protocol/acp-node";
 import { createPublicClient, http } from "viem";
 import { base } from "viem/chains";
 import { createLogger } from "../../utils/logger.ts";
-import { STABLECOIN_SYMBOLS, USDC_BASE, ERC20_ABI, CHAIN_CONFIG } from "../../utils/constants.ts";
+import { STABLECOIN_SYMBOLS, USDC_BASE, ERC20_ABI, CHAIN_CONFIG, BASE_CHAIN_ID } from "../../utils/constants.ts";
+
+/**
+ * Ensure the Fare object has chainId set (required by deliverPayable).
+ * The SDK's deliverPayable checks fare.chainId to decide same-chain vs cross-chain.
+ * If chainId is undefined, it incorrectly routes to cross-chain and fails.
+ */
+function ensureFareChainId(fare: InstanceType<typeof Fare>): InstanceType<typeof Fare> {
+  if (!fare.chainId) {
+    return new Fare(fare.contractAddress, fare.decimals, BASE_CHAIN_ID);
+  }
+  return fare;
+}
 import type {
+  AnalysisResult,
   ExecuteHedgeRequirement,
   ExecuteHedgeDeliverable,
   HedgePlaced,
@@ -169,7 +182,7 @@ async function rejectWithRefund(
   try {
     const payable = job.netPayableAmount;
     if (payable && payable > 0) {
-      const fareAmount = new FareAmount(payable, job.baseFare);
+      const fareAmount = new FareAmount(payable, ensureFareChainId(job.baseFare));
       await job.rejectPayable(reason, fareAmount);
       try { await job.createNotification(reason); } catch { /* non-fatal */ }
       return;
@@ -189,11 +202,17 @@ async function rejectWithRefund(
 // =============================================
 
 /**
- * Analyze wallet and build hedge plan. Returns the confirmation message text,
- * or null if the job was already rejected/delivered (edge cases).
+ * Analyze wallet and build hedge plan. Returns an AnalysisResult:
+ * - { type: "plan", message } for a successful hedge plan
+ * - { type: "error", message } when hedging is not possible
+ *
+ * IMPORTANT: This function NEVER calls job.reject() because it runs
+ * AFTER accept(). Calling reject() post-accept causes "Already signed"
+ * nonce conflicts on the Alchemy proxy. The caller handles the result.
+ *
  * Called during REQUEST phase so buyer sees the plan before paying.
  */
-export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<string | null> {
+export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisResult> {
   const jlog = log.withJob(job.id);
   jlog.info("Phase A: Analyzing wallet for hedge plan");
 
@@ -216,13 +235,12 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<string | 
     const exposure = analyzeExposure(rawBalances, prices);
     tWallet.end();
 
-    // Edge case: stablecoin-only portfolio — reject immediately (no confirmation needed)
+    // Edge case: stablecoin-only portfolio
     if (isStablecoinOnly(exposure)) {
-      jlog.info("Portfolio is stablecoin-only, rejecting");
+      jlog.info("Portfolio is stablecoin-only, cannot hedge");
       setFailed(String(job.id));
       const reasoning = generateEdgeCaseMessage("stablecoins_only", { totalValue: exposure.total_value_usd });
-      await job.reject(reasoning);
-      return null;
+      return { type: "error", message: reasoning };
     }
 
     // Step 2: Scan Limitless markets + build strategy
@@ -235,14 +253,13 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<string | 
     }
     tMarkets.end();
 
-    // Edge case: no markets — reject immediately
+    // Edge case: no markets available
     if (scoredMarkets.length === 0) {
-      jlog.info("No hedging markets found, rejecting");
+      jlog.info("No hedging markets found");
       setFailed(String(job.id));
       const topNonStable = exposure.tokens.find((t) => !STABLECOIN_SYMBOLS.has(t.symbol));
       const reasoning = generateEdgeCaseMessage("no_markets_found", { topAsset: topNonStable?.symbol ?? "your holdings" });
-      await job.reject(reasoning);
-      return null;
+      return { type: "error", message: reasoning };
     }
 
     const { recommendations: rawRecommendations, diagnostics } = buildHedgeRecommendations(
@@ -255,10 +272,9 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<string | 
     );
 
     if (recommendations.length === 0) {
-      jlog.info("No viable recommendations after sizing, rejecting");
+      jlog.info("No viable recommendations after sizing");
       setFailed(String(job.id));
-      await job.reject("No viable hedge positions could be constructed within your budget and risk parameters.");
-      return null;
+      return { type: "error", message: "No viable hedge positions could be constructed within your budget and risk parameters." };
     }
 
     // Build the confirmation plan
@@ -299,15 +315,15 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<string | 
     // Return the formatted plan text — caller will pass to createRequirement
     const confirmationMsg = formatConfirmationMessage(plan);
     jlog.info("Hedge plan built, returning to caller");
-    return confirmationMsg;
+    return { type: "plan", message: confirmationMsg };
 
   } catch (err) {
     jlog.error("Failed during hedge analysis phase", err);
     setFailed(String(job.id));
-    await job.reject(
-      `Hedge analysis failed: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`
-    );
-    return null;
+    return {
+      type: "error",
+      message: `Hedge analysis failed: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
+    };
   }
 }
 
@@ -474,6 +490,12 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
         });
       } catch (err) {
         jlog.error(`Failed to place order for market ${rec.market_id}`, err);
+        // Stop placing orders if we're out of collateral — subsequent orders will also fail
+        const errMsg = err instanceof Error ? err.message : String(err);
+        if (errMsg.includes("Insufficient collateral") || errMsg.includes("Insufficient balance")) {
+          jlog.warn("Stopping order placement — insufficient collateral on exchange");
+          break;
+        }
       }
     }
 
@@ -637,7 +659,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
     // Return undeployed budget to buyer via deliverPayable if there's a meaningful remainder
     const UNDEPLOYED_RETURN_THRESHOLD = 0.01; // $0.01 minimum to bother returning
     if (undeployedUsdc > UNDEPLOYED_RETURN_THRESHOLD) {
-      const fareAmount = new FareAmount(undeployedUsdc, job.baseFare);
+      const fareAmount = new FareAmount(undeployedUsdc, ensureFareChainId(job.baseFare));
       await job.deliverPayable(JSON.stringify(deliverable), fareAmount);
       jlog.info(`Delivered with undeployed budget return ($${undeployedUsdc.toFixed(2)})`);
     } else {
@@ -661,7 +683,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
     try {
       const payable = job.netPayableAmount;
       if (payable && payable > 0) {
-        const fareAmount = new FareAmount(payable, job.baseFare);
+        const fareAmount = new FareAmount(payable, ensureFareChainId(job.baseFare));
         await job.rejectPayable(
           `Hedge execution failed: ${err instanceof Error ? err.message : "Unknown error"}`,
           fareAmount

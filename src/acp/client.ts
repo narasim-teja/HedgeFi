@@ -9,6 +9,9 @@ import { verifyDeliverable } from "./evaluation.ts";
 
 const log = createLogger("acp-client");
 
+// Dedup guard for evaluation — prevents duplicate socket events
+const evaluatingJobs = new Set<number>();
+
 export async function createHedgeFiClient(): Promise<AcpClient> {
   const privateKey = process.env.HEDGEFI_PRIVATE_KEY;
   const entityId = process.env.HEDGEFI_ENTITY_ID;
@@ -51,6 +54,13 @@ export async function createHedgeFiClient(): Promise<AcpClient> {
       }
     },
     onEvaluate: async (job: AcpJob) => {
+      // Dedup: skip if we're already evaluating this job
+      if (evaluatingJobs.has(job.id)) {
+        log.debug(`Job #${job.id} evaluation already in progress, skipping duplicate`);
+        return;
+      }
+      evaluatingJobs.add(job.id);
+
       log.info(`Evaluation requested for job #${job.id}`, {
         phase: job.phase,
       });
@@ -66,6 +76,9 @@ export async function createHedgeFiClient(): Promise<AcpClient> {
         } catch (fallbackErr) {
           log.error(`Job #${job.id}: fallback evaluation also failed`, fallbackErr);
         }
+      } finally {
+        // Clean up after a delay to allow for any late duplicates
+        setTimeout(() => evaluatingJobs.delete(job.id), 30_000);
       }
     },
   });

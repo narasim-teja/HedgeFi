@@ -1,5 +1,14 @@
 import type { AcpJob, AcpMemo } from "@virtuals-protocol/acp-node";
-import { AcpJobPhases, FareAmount, MemoType } from "@virtuals-protocol/acp-node";
+import { AcpJobPhases, Fare, FareAmount, MemoType } from "@virtuals-protocol/acp-node";
+import { BASE_CHAIN_ID } from "../utils/constants.ts";
+
+/** Ensure Fare has chainId set (required by deliverPayable/createPayableRequirement). */
+function ensureFareChainId(fare: InstanceType<typeof Fare>): InstanceType<typeof Fare> {
+  if (!fare.chainId) {
+    return new Fare(fare.contractAddress, fare.decimals, BASE_CHAIN_ID);
+  }
+  return fare;
+}
 import { createLogger } from "../utils/logger.ts";
 import type { JobName } from "../utils/types.ts";
 import { handleHedgeAnalysis } from "./jobs/hedge-analysis.ts";
@@ -21,7 +30,20 @@ import { withBuyerLock } from "../utils/job-lock.ts";
 
 const log = createLogger("handler");
 
+/** Small delay to let UserOperation nonces settle on the RPC proxy. */
+function settleDelay(ms: number = 2000): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 const VALID_JOBS: JobName[] = ["hedge_analysis", "execute_hedge", "close_hedge"];
+
+// Deduplication: track jobs we're already processing to prevent
+// duplicate socket events from causing "Already signed" RPC errors.
+const processingJobs = new Set<string>();
+
+function jobKey(jobId: number | string, phase: number | string): string {
+  return `${jobId}:${phase}`;
+}
 
 function parseRawRequirement(job: AcpJob): Record<string, unknown> {
   const raw = job.requirement;
@@ -39,13 +61,28 @@ export async function handleNewTask(
   const jobName = job.name as JobName | undefined;
   const jobPhase = job.phase;
 
+  // Dedup: skip if we're already processing this exact job+phase
+  const key = jobKey(job.id, jobPhase);
+  if (processingJobs.has(key)) {
+    log.debug(`Job #${job.id} phase ${jobPhase} already in progress, skipping duplicate`);
+    return;
+  }
+  processingJobs.add(key);
+
   log.info(`Dispatching job #${job.id}`, {
     name: jobName,
     phase: jobPhase,
     memoToSignId: memoToSign?.id,
   });
 
-  // Phase REQUEST: Job just arrived — accept, analyze, and create requirement with plan
+  try {
+
+  // Phase REQUEST: Job just arrived — validate, analyze, then accept only if viable
+  //
+  // IMPORTANT: reject() is only safe BEFORE accept(). After accept() it causes
+  // "Already signed" nonce conflicts on the Alchemy proxy. So we do ALL
+  // validation and analysis BEFORE calling accept(). Only accept if we have
+  // a viable plan to send as a requirement.
   if (jobPhase === AcpJobPhases.REQUEST) {
     if (!jobName || !VALID_JOBS.includes(jobName)) {
       log.warn(`Job #${job.id} has invalid name: ${jobName}, rejecting`);
@@ -53,47 +90,81 @@ export async function handleNewTask(
       return;
     }
 
-    log.info(`Accepting job #${job.id} (${jobName})`);
-    await job.accept(`HedgeFi accepts ${jobName} job`);
+    // Step 1: Pre-validate requirement inputs
+    const rawReq = parseRawRequirement(job);
+    let preValidation: ValidationResult = { valid: true };
 
-    // For execute_hedge and close_hedge: run analysis/preview BEFORE payment
-    // so the buyer sees exactly what they're paying for.
-    // Use createPayableRequirement() per ACP best practices for fund-transfer agents.
+    switch (jobName) {
+      case "execute_hedge":
+        preValidation = validateExecuteHedgeReq(rawReq);
+        break;
+      case "hedge_analysis":
+        preValidation = validateHedgeAnalysisReq(rawReq);
+        break;
+      case "close_hedge":
+        preValidation = validateCloseHedgeReq(rawReq);
+        break;
+    }
+
+    if (!preValidation.valid) {
+      log.warn(`Job #${job.id} pre-validation failed: ${preValidation.error}`);
+      await job.reject(`Invalid request: ${preValidation.error}`);
+      return;
+    }
+
     const agentAddress = process.env.HEDGEFI_WALLET_ADDRESS as `0x${string}` | undefined;
 
+    // Step 2: For execute_hedge and close_hedge, run analysis/preview BEFORE
+    // accepting so we can cleanly reject() if the request isn't viable.
     if (jobName === "execute_hedge") {
-      const planMessage = await handleExecuteHedgeAnalysis(job);
-      if (planMessage) {
-        const rawReq = parseRawRequirement(job);
-        const budget = Number(rawReq.hedge_budget_usdc) || 0;
+      const result = await handleExecuteHedgeAnalysis(job);
 
-        if (agentAddress && budget > 0) {
-          const fareAmount = new FareAmount(budget, job.baseFare ?? 0);
-          await job.createPayableRequirement(planMessage, MemoType.PAYABLE_REQUEST, fareAmount, agentAddress);
-        } else {
-          await job.createRequirement(planMessage);
-        }
-        log.info(`Job #${job.id}: hedge plan sent, waiting for buyer review + payment`);
+      if (result.type === "error") {
+        log.info(`Job #${job.id}: analysis failed, rejecting — ${result.message.substring(0, 100)}`);
+        await job.reject(result.message);
+        return;
       }
-      // If null, the handler already rejected/delivered (edge case)
+
+      // Plan is viable — accept, then send as payable requirement
+      log.info(`Accepting job #${job.id} (${jobName})`);
+      await job.accept(`HedgeFi accepts ${jobName} job`);
+      await settleDelay();
+
+      const budget = Number(rawReq.hedge_budget_usdc) || 0;
+      if (agentAddress && budget > 0) {
+        const fareAmount = new FareAmount(budget, ensureFareChainId(job.baseFare));
+        await job.createPayableRequirement(result.message, MemoType.PAYABLE_REQUEST, fareAmount, agentAddress);
+      } else {
+        await job.createRequirement(result.message);
+      }
+      log.info(`Job #${job.id}: hedge plan sent, waiting for buyer review + payment`);
       return;
     }
 
     if (jobName === "close_hedge") {
-      const previewMessage = await handleCloseHedgePreview(job);
-      if (previewMessage) {
-        if (agentAddress) {
-          const fareAmount = new FareAmount(0, job.baseFare ?? 0);
-          await job.createPayableRequirement(previewMessage, MemoType.PAYABLE_REQUEST, fareAmount, agentAddress);
-        } else {
-          await job.createRequirement(previewMessage);
-        }
-        log.info(`Job #${job.id}: close preview sent, waiting for buyer review + payment`);
+      const result = await handleCloseHedgePreview(job);
+
+      if (result.type === "error") {
+        log.info(`Job #${job.id}: close preview failed, rejecting — ${result.message.substring(0, 100)}`);
+        await job.reject(result.message);
+        return;
       }
+
+      // Preview is viable — accept, then send as payable requirement
+      log.info(`Accepting job #${job.id} (${jobName})`);
+      await job.accept(`HedgeFi accepts ${jobName} job`);
+      await settleDelay();
+
+      // close_hedge has no upfront cost — use plain requirement (RPC rejects FareAmount(0))
+      await job.createRequirement(result.message);
+      log.info(`Job #${job.id}: close preview sent, waiting for buyer approval`);
       return;
     }
 
-    // Default for hedge_analysis and others
+    // Default for hedge_analysis and others — accept then create requirement
+    log.info(`Accepting job #${job.id} (${jobName})`);
+    await job.accept(`HedgeFi accepts ${jobName} job`);
+    await settleDelay();
     await job.createRequirement(`Please confirm payment to proceed with ${jobName}.`);
     log.info(`Job #${job.id}: requirement created, waiting for buyer payment`);
     return;
@@ -131,7 +202,7 @@ export async function handleNewTask(
         ) {
           const fareAmount = new FareAmount(
             job.netPayableAmount,
-            job.baseFare ?? 0
+            ensureFareChainId(job.baseFare)
           );
           await job.rejectPayable(`Validation failed: ${validation.error}`, fareAmount);
         } else {
@@ -172,4 +243,9 @@ export async function handleNewTask(
   }
 
   log.warn(`Job #${job.id}: unhandled phase ${jobPhase}`);
+
+  } finally {
+    // Clean up dedup entry after a delay (allows late duplicates to be caught)
+    setTimeout(() => processingJobs.delete(key), 60_000);
+  }
 }
