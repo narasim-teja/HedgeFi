@@ -3,7 +3,7 @@ import { Fare, FareAmount } from "@virtuals-protocol/acp-node";
 import { createPublicClient, http } from "viem";
 import { base } from "viem/chains";
 import { createLogger } from "../../utils/logger.ts";
-import { STABLECOIN_SYMBOLS, USDC_BASE, ERC20_ABI, CHAIN_CONFIG, BASE_CHAIN_ID } from "../../utils/constants.ts";
+import { STABLECOIN_SYMBOLS, USDC_BASE, ERC20_ABI, CHAIN_CONFIG, BASE_CHAIN_ID, MAX_HEDGE_BUDGET_USD } from "../../utils/constants.ts";
 
 /**
  * Ensure the Fare object has chainId set (required by deliverPayable).
@@ -226,6 +226,16 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
     buyerAddress: job.clientAddress,
   });
 
+  // Budget cap check (testing phase safety)
+  if (req.hedge_budget_usdc > MAX_HEDGE_BUDGET_USD) {
+    jlog.warn(`Budget $${req.hedge_budget_usdc} exceeds testing cap $${MAX_HEDGE_BUDGET_USD}`);
+    setFailed(String(job.id));
+    return {
+      type: "error",
+      message: `Budget cap: $${MAX_HEDGE_BUDGET_USD} max during testing phase. Requested: $${req.hedge_budget_usdc}. Please reduce your budget.`,
+    };
+  }
+
   try {
     // Step 1: Read real wallet exposure
     const tWallet = jlog.time("Read wallet balances");
@@ -419,10 +429,23 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
 
         // Determine order type: GTC for larger orders with expiration data
         const expirationTimestamp = fullMarket.expirationTimestamp;
+
+        // Skip markets expiring within 5 minutes
+        const EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+        if (expirationTimestamp <= Date.now() + EXPIRY_BUFFER_MS) {
+          jlog.warn(`Market ${marketSlug} expires in <5 min, skipping`);
+          continue;
+        }
+
         const useGtc = orderAmount >= GTC_ORDER_THRESHOLD_USD && expirationTimestamp > Date.now();
         const hedgePrice = rec.action === "BUY_YES"
-          ? (fullMarket.prices?.[0] ?? 0)
-          : (fullMarket.prices?.[1] ?? 0);
+          ? (fullMarket.prices?.[0] ?? null)
+          : (fullMarket.prices?.[1] ?? null);
+
+        if (hedgePrice === null || hedgePrice <= 0 || hedgePrice >= 1) {
+          jlog.warn(`Invalid hedge price (${hedgePrice}) for ${marketSlug}, skipping`);
+          continue;
+        }
 
         const result = await placeHedgeOrder({
           marketSlug,

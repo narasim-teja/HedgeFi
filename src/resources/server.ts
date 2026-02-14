@@ -1,6 +1,7 @@
 import { createLogger } from "../utils/logger.ts";
 import {
   getActivePositions,
+  getAllActivePositions,
   getHistoricalPositions,
   getPositionsForMarket,
 } from "../db/positions.ts";
@@ -256,6 +257,22 @@ export function startResourceServer(): void {
 
         case "/health":
           return jsonResponse({ status: "ok", timestamp: new Date().toISOString() });
+
+        case "/status": {
+          let activeCount = 0;
+          try {
+            activeCount = getAllActivePositions().length;
+          } catch { /* fallback to 0 */ }
+          return jsonResponse({
+            agent: "HedgeFi",
+            version: "1.0.0-hackathon",
+            status: "operational",
+            model: "insurance",
+            services: { acp: "connected", limitless: "ready", database: "ok" },
+            activePositions: activeCount,
+            timestamp: new Date().toISOString(),
+          });
+        }
 
         default:
           return errorResponse("Not found", 404);

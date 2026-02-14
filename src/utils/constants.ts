@@ -212,6 +212,9 @@ export const MIN_MARKET_LIQUIDITY_USD = 10;
 /** Minimum hedge budget to provide meaningful coverage */
 export const MIN_HEDGE_BUDGET_USD = 0.5;
 
+/** Maximum hedge budget during testing phase — increase for production */
+export const MAX_HEDGE_BUDGET_USD = 5;
+
 /** Market data cache TTL */
 export const MARKET_CACHE_TTL_MS = 120_000;
 

@@ -10,6 +10,7 @@ function ensureFareChainId(fare: InstanceType<typeof Fare>): InstanceType<typeof
   return fare;
 }
 import { createLogger } from "../../utils/logger.ts";
+import { sanitizeNumber } from "../../utils/math.ts";
 import type {
   AnalysisResult,
   CloseHedgeRequirement,
@@ -258,8 +259,19 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
     let positions: DbPosition[];
 
     if (positionIds && positionIds.length > 0) {
-      positions = positionIds
-        .map((id) => getPosition(id))
+      const lookups = positionIds.map((id) => ({ id, pos: getPosition(id) }));
+      const notFound = lookups.filter((l) => l.pos === null);
+      const alreadyClosed = lookups.filter((l) => l.pos !== null && l.pos.status !== "active");
+
+      if (notFound.length > 0) {
+        jlog.warn(`${notFound.length} position ID(s) not found: ${notFound.map((l) => l.id).join(", ")}`);
+      }
+      if (alreadyClosed.length > 0) {
+        jlog.warn(`${alreadyClosed.length} position(s) already closed: ${alreadyClosed.map((l) => l.id).join(", ")}`);
+      }
+
+      positions = lookups
+        .map((l) => l.pos)
         .filter((p): p is DbPosition => p !== null && p.status === "active");
     } else {
       positions = resolvePositions(req, buyerAddress);
@@ -305,6 +317,14 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
       const totalShares = group.reduce((s, p) => s + p.shares, 0);
       const totalCost = group.reduce((s, p) => s + p.total_cost_usdc, 0);
 
+      if (totalShares <= 0) {
+        jlog.warn(`Position group on ${representative.market_slug} has zero total shares, skipping`);
+        for (const pos of group) {
+          updatePositionStatus(pos.id, "close_failed");
+        }
+        continue;
+      }
+
       try {
         await ensureCtApproval(LIMITLESS_CT_CONTRACT, representative.venue_exchange);
 
@@ -325,9 +345,9 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
 
         // Distribute sale proceeds proportionally to each position in the group
         for (const pos of group) {
-          const sharesFraction = pos.shares / totalShares;
-          const posReturn = saleAmount * sharesFraction;
-          const posPnl = posReturn - pos.total_cost_usdc;
+          const sharesFraction = sanitizeNumber(pos.shares / totalShares);
+          const posReturn = sanitizeNumber(saleAmount * sharesFraction);
+          const posPnl = sanitizeNumber(posReturn - pos.total_cost_usdc);
 
           updatePositionStatus(pos.id, "closed", {
             closePrice: result.avgPrice,
@@ -360,7 +380,7 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
           market_id: representative.market_slug,
           shares_sold: result.filledSize,
           sale_price: result.avgPrice,
-          realized_pnl: Math.round(groupPnl * 100) / 100,
+          realized_pnl: Math.round(sanitizeNumber(groupPnl) * 100) / 100,
         });
 
         totalReturned += saleAmount;

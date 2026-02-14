@@ -334,8 +334,9 @@ export async function placeHedgeOrder(params: PlaceOrderParams): Promise<PlaceOr
     totalCost = usdcAmount; // FOK: either full fill or nothing
   } else if (side === LimitlessOrderSide.BUY) {
     // FOK may have filled directly without makerMatches in some cases
+    // Express in micro-units (6 decimals) for consistency with matched path
     filledSize = usdcAmount > 0
-      ? Math.floor(usdcAmount / 1) // approximate, will be refined by position tracking
+      ? Math.floor(usdcAmount * 1e6)
       : 0;
     totalCost = usdcAmount;
   }

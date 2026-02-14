@@ -24,10 +24,6 @@ export function validateEnvironment(): void {
       pattern: /^0x[0-9a-fA-F]{40}$/,
       description: "40-char hex address (0x-prefixed)",
     },
-    {
-      name: "GEMINI_API_KEY",
-      description: "Gemini API key for AI reasoning",
-    },
   ];
 
   const errors: string[] = [];
@@ -49,5 +45,10 @@ export function validateEnvironment(): void {
     throw new Error(
       `Environment validation failed:\n${errors.join("\n")}`
     );
+  }
+
+  // Optional env vars — warn but don't block startup
+  if (!process.env.GEMINI_API_KEY) {
+    console.warn("  Warning: GEMINI_API_KEY not set — AI reasoning will use template fallbacks");
   }
 }

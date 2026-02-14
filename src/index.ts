@@ -41,9 +41,17 @@ async function main() {
       }
     }, CLEANUP_INTERVAL_MS);
     // Run once at startup too
-    cleanupOldJobs(30);
+    try {
+      cleanupOldJobs(30);
+    } catch (err) {
+      log.warn("Job state cleanup failed on startup", err);
+    }
     // Recover any jobs stuck in "executing" from a previous crash
-    recoverStuckJobs(10);
+    try {
+      recoverStuckJobs(10);
+    } catch (err) {
+      log.warn("Failed to recover stuck jobs on startup", err);
+    }
 
     log.info("HedgeFi agent is live and listening for jobs");
     log.info(`Agent wallet: ${acpClient.walletAddress}`);

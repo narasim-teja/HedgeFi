@@ -121,13 +121,14 @@ describe("validateEnvironment", () => {
     expect(() => validateEnvironment()).not.toThrow();
   });
 
-  test("throws on missing GEMINI_API_KEY", () => {
+  test("warns but does not throw on missing GEMINI_API_KEY", () => {
     process.env.HEDGEFI_PRIVATE_KEY = "0x" + "a".repeat(64);
     process.env.HEDGEFI_ENTITY_ID = "12345";
     process.env.HEDGEFI_WALLET_ADDRESS = "0x" + "b".repeat(40);
     delete process.env.GEMINI_API_KEY;
 
-    expect(() => validateEnvironment()).toThrow(/GEMINI_API_KEY/);
+    // GEMINI_API_KEY is now optional — should warn but not throw
+    expect(() => validateEnvironment()).not.toThrow();
   });
 
   test("throws on invalid private key format", () => {
