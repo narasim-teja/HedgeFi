@@ -9,12 +9,6 @@
   Hedges crypto portfolios using prediction markets on Limitless Exchange
 </p>
 
-<p align="center">
-  <a href="https://app.virtuals.io/acp">ACP Service Registry</a> &middot;
-  <a href="https://limitless.exchange">Limitless Exchange</a> &middot;
-  <a href="https://whitepaper.virtuals.io/acp-product-resources/introducing-acp-v2/acp-v2-prediction-market-use-case">ACP v2 Prediction Market Guide</a>
-</p>
-
 ---
 
 ## What is HedgeFi?
@@ -50,38 +44,108 @@ A user tells Butler: *"Hedge my ETH holdings"* or *"Protect my portfolio at 0xAB
 
 ## Architecture
 
+HedgeFi uses Virtuals ACP v2's **payable requirement** system. Every fund-transfer job runs in two phases -- the buyer always reviews the plan before paying.
+
 ```
-USER                  BUTLER               ACP ESCROW           HEDGEFI              LIMITLESS
- |                      |                      |                   |                    |
- | "Hedge my ETH"       |                      |                   |                    |
- |--------------------->|                      |                   |                    |
- |                      | Create Fund-Transfer |                   |                    |
- |                      | Job + deposit USDC   |                   |                    |
- |                      |--------------------->|                   |                    |
- |                      |                      | Release funds     |                    |
- |                      |                      |------------------>|                    |
- |                      |                      |                   | Read wallet        |
- |                      |                      |                   | Scan markets       |
- |                      |                      |                   | Place EIP-712      |
- |                      |                      |                   | signed orders      |
- |                      |                      |                   |------------------>|
- |                      |                      |                   |    Shares filled   |
- |                      |                      |                   |<------------------|
- |                      |                      |   Deliver result  |                    |
- |                      |                      |<------------------|                    |
- |                      |  Hedge report + AI   |                   |                    |
- |<---------------------|  reasoning           |                   |                    |
+PHASE 1: REQUEST (Analyze & Propose)
+======================================
+USER / BUTLER              HEDGEFI                  USER'S PORTFOLIO
+     |                        |                           |
+     | "Hedge my ETH"         |                           |
+     |----------------------->|                           |
+     |                        | Read balances (public RPC)|
+     |                        |-------------------------->|
+     |                        |<--------------------------|
+     |                        | Analyze exposure          |
+     |                        | Scan Limitless markets    |
+     |                        | Build hedge plan          |
+     |                        |                           |
+     |                        | accept() +                |
+     |                        | createPayableRequirement  |
+     |                        | ("Send $X to 0xAgent...")  |
+     |<-----------------------|                           |
+     | Review plan + cost     |                           |
+     | APPROVE or REJECT      |                           |
+
+
+PHASE 2: TRANSACTION (Pay & Execute)
+======================================
+USER / BUTLER       ACP ESCROW         HEDGEFI WALLET        LIMITLESS
+     |                   |                   |                     |
+     | Approve + pay     |                   |                     |
+     |   USDC            |                   |                     |
+     |------------------>|                   |                     |
+     |                   | Auto-transfer     |                     |
+     |                   | USDC to agent's   |                     |
+     |                   | external wallet   |                     |
+     |                   |------------------>|                     |
+     |                   |                   | Approve USDC to     |
+     |                   |                   | exchange contract   |
+     |                   |                   |                     |
+     |                   |                   | Sign EIP-712 orders |
+     |                   |                   | (HEDGEFI_PRIVATE_KEY)|
+     |                   |                   |-------------------->|
+     |                   |                   |   USDC debited      |
+     |                   |                   |   YES/NO shares     |
+     |                   |                   |   credited (ERC1155)|
+     |                   |                   |<--------------------|
+     |                   |                   |                     |
+     |                   | deliverPayable:   |                     |
+     |                   | return undeployed |                     |
+     |                   | budget + report   |                     |
+     |<------------------|<------------------|                     |
+     | Hedge report +    |                   |                     |
+     | AI reasoning +    |                   |                     |
+     | unspent USDC      |                   |                     |
 ```
 
 **Three wallets, zero key sharing:**
 
-| Wallet | Owner | Purpose |
-|---|---|---|
-| User's wallet | Human | Holds portfolio. Funds Butler. Can be any external address. |
-| Butler agent wallet | Virtuals | Routes USDC from user to ACP escrow. |
-| HedgeFi agent wallet | Us | Receives USDC, signs Limitless orders, holds positions. |
+| Wallet | Owner | Purpose | Holds |
+|---|---|---|---|
+| User's portfolio wallet | Human | Holds crypto portfolio. Can be any external address. HedgeFi reads balances via public RPC -- **no keys needed**. | ETH, WBTC, LINK, etc. |
+| Butler agent wallet | Virtuals Protocol | Routes USDC payment from user to ACP escrow smart contract. | USDC (temporarily) |
+| HedgeFi external wallet | HedgeFi | Receives USDC from escrow, executes trades on Limitless, holds hedge positions. This is a standard EOA on Base with its own private key (`HEDGEFI_PRIVATE_KEY`). | USDC + YES/NO shares (ERC-1155) |
 
-The user **never** shares their private key. HedgeFi reads wallet balances via public RPC calls and trades with its own agent wallet using the user's deposited USDC.
+**Why does HedgeFi need its own private key?** The `HEDGEFI_PRIVATE_KEY` env var is for HedgeFi's external wallet on Base (not an ACP smart wallet). It's used to:
+
+1. **Approve USDC** to Limitless Exchange contracts (ERC-20 approval tx)
+2. **Sign EIP-712 orders** for prediction market trades (off-chain signatures submitted to Limitless CLOB)
+3. **Approve conditional tokens** (ERC-1155) when selling/closing positions
+
+The user **never** shares their private key. HedgeFi reads wallet balances via public RPC calls and trades with its own external wallet using USDC received from ACP escrow.
+
+---
+
+## How ACP v2 Fund Transfers Work
+
+### REQUEST Phase -- Buyer Reviews Plan Before Paying
+
+1. **Buyer creates job** via Butler -- e.g. "Hedge my 2 ETH holdings with $50 budget"
+2. **HedgeFi validates inputs** -- wallet address, budget, risk tolerance
+3. **HedgeFi analyzes portfolio** -- reads wallet balances via public RPC (no keys needed)
+4. **HedgeFi builds hedge plan** -- scans Limitless markets, sizes positions, estimates costs
+5. **HedgeFi accepts job** -- calls `job.accept()` to signal willingness
+6. **HedgeFi sends payable requirement** -- calls `job.createPayableRequirement(plan, PAYABLE_REQUEST, fareAmount, HEDGEFI_WALLET_ADDRESS)` which tells ACP: "I need $50 USDC sent to my external wallet to execute this"
+7. **Buyer reviews** -- sees the hedge plan with estimated positions, costs, coverage. Can APPROVE (pay) or REJECT (cancel, no charge)
+
+### TRANSACTION Phase -- Payment Triggers Execution
+
+1. **Buyer approves and pays** -- USDC flows from buyer wallet into ACP Escrow smart contract
+2. **ACP SDK auto-transfers** -- escrow routes USDC to HedgeFi's external wallet (`HEDGEFI_WALLET_ADDRESS`). This happens automatically before `handleExecuteHedgeExecution()` is called
+3. **Balance check** -- HedgeFi verifies USDC arrived in its wallet. If insufficient, refunds buyer via `job.rejectPayable()`
+4. **USDC approval** -- HedgeFi signs an ERC-20 `approve()` tx allowing the Limitless Exchange contract to spend its USDC
+5. **Order placement** -- HedgeFi signs EIP-712 orders with `HEDGEFI_PRIVATE_KEY` for each hedge position (FOK for small orders, GTC for larger)
+6. **Exchange settlement** -- Limitless debits USDC from HedgeFi's wallet and credits YES/NO shares (ERC-1155 conditional tokens)
+7. **Budget accountability** -- any undeployed USDC (e.g. from partially filled orders) is returned to the buyer via `job.deliverPayable(deliverable, undeployedAmount)`
+8. **Delivery** -- hedge report with positions, costs, coverage ratio, and AI reasoning is delivered as the job result
+
+### Key Points
+
+- **Escrow is a routing mechanism** -- funds flow through it to the agent's external wallet, they don't sit there permanently
+- **Two-phase safety** -- buyer sees the full plan BEFORE paying; can reject with zero cost
+- **Budget returns** -- undeployed funds are automatically returned to buyer
+- **No key sharing** -- user's portfolio is read via public blockchain data; HedgeFi trades with its own wallet
 
 ---
 
@@ -281,17 +345,20 @@ hedge/
 ## Environment Variables
 
 ```bash
-# Required -- Agent identity
-HEDGEFI_PRIVATE_KEY=0x...           # 64-char hex private key (Base)
-HEDGEFI_ENTITY_ID=...               # Numeric entity ID from ACP registry
-HEDGEFI_WALLET_ADDRESS=0x...        # Agent wallet address
+# Required -- HedgeFi agent identity
+HEDGEFI_PRIVATE_KEY=0x...           # Private key for HedgeFi's EXTERNAL wallet (EOA) on Base.
+                                     # Used to: approve USDC, sign EIP-712 Limitless orders,
+                                     # approve ERC-1155 tokens. NOT an ACP smart wallet key.
+HEDGEFI_ENTITY_ID=...               # Numeric entity ID from ACP Service Registry
+HEDGEFI_WALLET_ADDRESS=0x...        # HedgeFi's external wallet address (must match private key).
+                                     # Receives USDC from ACP escrow, holds hedge positions.
 
-# Optional -- Test buyer
-BUYER_PRIVATE_KEY=0x...
-BUYER_ENTITY_ID=...
-BUYER_WALLET_ADDRESS=0x...
+# Optional -- Test buyer (for local testing with test-buyer.ts)
+BUYER_PRIVATE_KEY=0x...             # Test buyer's wallet private key
+BUYER_ENTITY_ID=...                 # Test buyer's ACP entity ID
+BUYER_WALLET_ADDRESS=0x...          # Test buyer's wallet address
 
-# Optional -- AI reasoning (falls back to templates if missing)
+# Optional -- AI reasoning (falls back to template reasoning if missing)
 GEMINI_API_KEY=...
 
 # Optional -- RPC endpoints (defaults to public RPCs)
@@ -302,9 +369,6 @@ ALCHEMY_API_KEY=...
 
 # Optional -- CoinGecko (free tier works without key)
 COINGECKO_API_KEY=...
-
-# Optional -- Resource server port (default: 3001)
-RESOURCE_PORT=3001
 ```
 
 ---
@@ -328,57 +392,13 @@ The resource server runs on port 3001 by default.
 
 Every ACP job = payment. HedgeFi earns recurring revenue because prediction market positions expire hourly/daily -- users who want ongoing protection keep paying.
 
-| Job Type | Revenue per Job | Frequency |
+| Job Type | Revenue per Job | Budget Flow |
 |---|---|---|
-| `hedge_analysis` | $0.10 | Per analysis request |
-| `execute_hedge` | $0.50 + hedge budget flow | Per hedge placement |
-| `close_hedge` | $0.25 | Per position close |
+| `hedge_analysis` | $0.01 | No fund transfer -- service-only |
+| `execute_hedge` | $0.1 | Buyer's budget → Escrow → HedgeFi wallet → Limitless (buys shares) |
+| `close_hedge` | $0.1 | HedgeFi wallet → Limitless (sells shares) → USDC returned to buyer |
 
----
+**Recurring revenue:** Prediction market positions expire hourly/daily. Users who want ongoing protection must re-hedge, generating recurring job fees.
 
-## Supported Assets
+**Testing phase:** Budget cap is $5 max per hedge (configurable in `constants.ts` → `MAX_HEDGE_BUDGET_USD`).
 
-| Asset | Symbol | Chains | Hedging Via |
-|---|---|---|---|
-| Ethereum | WETH/ETH | Base, Ethereum, Arbitrum | Limitless ETH markets |
-| Bitcoin | WBTC/cbBTC | Base, Ethereum, Arbitrum | Limitless BTC markets |
-| Chainlink | LINK | Ethereum, Arbitrum | Limitless LINK markets |
-| Uniswap | UNI | Ethereum, Arbitrum | Limitless UNI markets |
-| Arbitrum | ARB | Arbitrum | Limitless ARB markets |
-| Aave | AAVE | Ethereum, Arbitrum | Limitless AAVE markets |
-
-Stablecoins (USDC, USDT, DAI) are detected but excluded from hedging -- they have no directional risk.
-
----
-
-## SDK Bug Reports
-
-Issues found and reported to the Virtuals team:
-
-1. **AJV "Address" Format Crash** -- The ACP UI generates `format: "address"` in JSON schemas, but the SDK's AJV validator doesn't register this format. **Workaround:** Use "Plain" subtype instead.
-
-2. **Double `init()` Duplicate Sockets** -- The constructor calls `this.init()` without `await`. If you also call `await acpClient.init()`, two sockets are created. **Fix:** Pass `skipSocketConnection: true` in constructor, then call `await client.init()`.
-
----
-
-## Judging Criteria
-
-| Criteria | How HedgeFi Delivers |
-|---|---|
-| Executes trades / DeFi actions | Places real EIP-712 signed orders on Limitless Exchange |
-| Risk controls | Position sizing, budget caps, slippage protection, diversification |
-| Explains why it acted | Gemini AI reasoning on every hedge decision in plain English |
-| Auditable trail | ACP memos on-chain + Limitless order IDs + full job history in SQLite |
-| Multiple data sources | Wallet balances (viem), token prices (CoinGecko), prediction markets (Limitless), AI (Gemini) |
-| Customized for users | 3 risk levels, configurable budgets, any wallet address, per-user ACP accounts |
-| Live product | Butler routes real users to HedgeFi. Zero competition on ACP. |
-| Revenue generation | Every job = ACP payment. Recurring because hedges expire daily. |
-| ACP multiplier (2x) | Full ACP v2: Fund-Transfer Jobs, Resources, Notifications, Evaluation |
-| Virtuals launch multiplier (2x) | Standard Launch as $HEDGE |
-
----
-
-<p align="center">
-  Built for the Virtuals Protocol Hackathon<br/>
-  <strong>HedgeFi</strong> -- portfolio insurance on autopilot
-</p>
