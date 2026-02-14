@@ -4,8 +4,7 @@ import { createHedgeFiClient } from "./acp/client.ts";
 import { authenticateAgent } from "./limitless/auth.ts";
 import { startResourceServer } from "./resources/server.ts";
 import { cleanupOldJobs, recoverStuckJobs } from "./db/job-state.ts";
-// Importing schema initializes the SQLite database on startup
-import "./db/schema.ts";
+import { initSchema } from "./db/schema.ts";
 
 const log = createLogger("main");
 
@@ -15,6 +14,9 @@ async function main() {
   // Validate environment variables immediately at startup
   validateEnvironment();
   log.info("Environment validation passed");
+
+  // Initialize database schema (Postgres tables)
+  await initSchema();
 
   try {
     // Authenticate with Limitless Exchange (auto-creates account on first login)
@@ -33,22 +35,22 @@ async function main() {
 
     // Periodic cleanup of old job state records (every 24h)
     const CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000;
-    setInterval(() => {
+    setInterval(async () => {
       try {
-        cleanupOldJobs(30);
+        await cleanupOldJobs(30);
       } catch (err) {
         log.warn("Job state cleanup failed", err);
       }
     }, CLEANUP_INTERVAL_MS);
     // Run once at startup too
     try {
-      cleanupOldJobs(30);
+      await cleanupOldJobs(30);
     } catch (err) {
       log.warn("Job state cleanup failed on startup", err);
     }
     // Recover any jobs stuck in "executing" from a previous crash
     try {
-      recoverStuckJobs(10);
+      await recoverStuckJobs(10);
     } catch (err) {
       log.warn("Failed to recover stuck jobs on startup", err);
     }

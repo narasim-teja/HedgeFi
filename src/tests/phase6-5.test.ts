@@ -106,6 +106,7 @@ describe("validateEnvironment", () => {
 
   afterEach(() => {
     // Restore original env
+    process.env.DATABASE_URL = originalEnv.DATABASE_URL;
     process.env.HEDGEFI_PRIVATE_KEY = originalEnv.HEDGEFI_PRIVATE_KEY;
     process.env.HEDGEFI_ENTITY_ID = originalEnv.HEDGEFI_ENTITY_ID;
     process.env.HEDGEFI_WALLET_ADDRESS = originalEnv.HEDGEFI_WALLET_ADDRESS;
@@ -113,6 +114,7 @@ describe("validateEnvironment", () => {
   });
 
   test("passes with valid env vars", () => {
+    process.env.DATABASE_URL = "postgresql://user:pass@localhost:5432/db";
     process.env.HEDGEFI_PRIVATE_KEY = "0x" + "a".repeat(64);
     process.env.HEDGEFI_ENTITY_ID = "12345";
     process.env.HEDGEFI_WALLET_ADDRESS = "0x" + "b".repeat(40);
@@ -122,6 +124,7 @@ describe("validateEnvironment", () => {
   });
 
   test("warns but does not throw on missing GEMINI_API_KEY", () => {
+    process.env.DATABASE_URL = "postgresql://user:pass@localhost:5432/db";
     process.env.HEDGEFI_PRIVATE_KEY = "0x" + "a".repeat(64);
     process.env.HEDGEFI_ENTITY_ID = "12345";
     process.env.HEDGEFI_WALLET_ADDRESS = "0x" + "b".repeat(40);
@@ -132,6 +135,7 @@ describe("validateEnvironment", () => {
   });
 
   test("throws on invalid private key format", () => {
+    process.env.DATABASE_URL = "postgresql://user:pass@localhost:5432/db";
     process.env.HEDGEFI_PRIVATE_KEY = "not-a-key";
     process.env.HEDGEFI_ENTITY_ID = "12345";
     process.env.HEDGEFI_WALLET_ADDRESS = "0x" + "b".repeat(40);
@@ -141,6 +145,7 @@ describe("validateEnvironment", () => {
   });
 
   test("throws on non-numeric entity ID", () => {
+    process.env.DATABASE_URL = "postgresql://user:pass@localhost:5432/db";
     process.env.HEDGEFI_PRIVATE_KEY = "0x" + "a".repeat(64);
     process.env.HEDGEFI_ENTITY_ID = "abc";
     process.env.HEDGEFI_WALLET_ADDRESS = "0x" + "b".repeat(40);
@@ -192,21 +197,21 @@ import {
   setFailed,
   cleanupOldJobs,
 } from "../db/job-state.ts";
-import { db } from "../db/schema.ts";
+import { sql } from "../db/schema.ts";
 
 describe("Job State CRUD", () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     // Clean up any test rows
-    db.run("DELETE FROM job_state WHERE job_id LIKE 'test-%'");
+    await sql`DELETE FROM job_state WHERE job_id LIKE 'test-%'`;
   });
 
-  afterEach(() => {
-    db.run("DELETE FROM job_state WHERE job_id LIKE 'test-%'");
+  afterEach(async () => {
+    await sql`DELETE FROM job_state WHERE job_id LIKE 'test-%'`;
   });
 
-  test("upsertJobState creates a new record", () => {
-    upsertJobState("test-1", { jobName: "execute_hedge", phase: "initialized" });
-    const state = getJobState("test-1");
+  test("upsertJobState creates a new record", async () => {
+    await upsertJobState("test-1", { jobName: "execute_hedge", phase: "initialized" });
+    const state = await getJobState("test-1");
 
     expect(state).not.toBeNull();
     expect(state!.job_id).toBe("test-1");
@@ -216,96 +221,96 @@ describe("Job State CRUD", () => {
     expect(state!.confirmation_payload).toBeNull();
   });
 
-  test("upsertJobState updates existing record", () => {
-    upsertJobState("test-2", { jobName: "execute_hedge", phase: "initialized" });
-    upsertJobState("test-2", { jobName: "execute_hedge", phase: "analysis_complete" });
+  test("upsertJobState updates existing record", async () => {
+    await upsertJobState("test-2", { jobName: "execute_hedge", phase: "initialized" });
+    await upsertJobState("test-2", { jobName: "execute_hedge", phase: "analysis_complete" });
 
-    const state = getJobState("test-2");
+    const state = await getJobState("test-2");
     expect(state!.phase).toBe("analysis_complete");
   });
 
-  test("setConfirmationSent stores payload and updates phase", () => {
-    upsertJobState("test-3", { jobName: "execute_hedge", phase: "initialized" });
+  test("setConfirmationSent stores payload and updates phase", async () => {
+    await upsertJobState("test-3", { jobName: "execute_hedge", phase: "initialized" });
 
     const plan = JSON.stringify({ budget: 100, recommendations: [] });
-    setConfirmationSent("test-3", plan);
+    await setConfirmationSent("test-3", plan);
 
-    const state = getJobState("test-3");
+    const state = await getJobState("test-3");
     expect(state!.confirmation_sent).toBe(1);
     expect(state!.confirmation_payload).toBe(plan);
     expect(state!.phase).toBe("awaiting_confirmation");
   });
 
-  test("setConfirmed updates phase", () => {
-    upsertJobState("test-4", { jobName: "execute_hedge", phase: "awaiting_confirmation" });
-    setConfirmed("test-4");
+  test("setConfirmed updates phase", async () => {
+    await upsertJobState("test-4", { jobName: "execute_hedge", phase: "awaiting_confirmation" });
+    await setConfirmed("test-4");
 
-    const state = getJobState("test-4");
+    const state = await getJobState("test-4");
     expect(state!.phase).toBe("confirmed");
   });
 
-  test("setDelivered updates phase", () => {
-    upsertJobState("test-5", { jobName: "execute_hedge", phase: "confirmed" });
-    setDelivered("test-5");
+  test("setDelivered updates phase", async () => {
+    await upsertJobState("test-5", { jobName: "execute_hedge", phase: "confirmed" });
+    await setDelivered("test-5");
 
-    const state = getJobState("test-5");
+    const state = await getJobState("test-5");
     expect(state!.phase).toBe("delivered");
   });
 
-  test("setFailed updates phase", () => {
-    upsertJobState("test-6", { jobName: "execute_hedge", phase: "executing" });
-    setFailed("test-6");
+  test("setFailed updates phase", async () => {
+    await upsertJobState("test-6", { jobName: "execute_hedge", phase: "executing" });
+    await setFailed("test-6");
 
-    const state = getJobState("test-6");
+    const state = await getJobState("test-6");
     expect(state!.phase).toBe("failed");
   });
 
-  test("getJobState returns null for non-existent job", () => {
-    const state = getJobState("test-nonexistent");
+  test("getJobState returns null for non-existent job", async () => {
+    const state = await getJobState("test-nonexistent");
     expect(state).toBeNull();
   });
 
-  test("cleanupOldJobs does not delete recent records", () => {
-    upsertJobState("test-7", { jobName: "execute_hedge", phase: "delivered" });
+  test("cleanupOldJobs does not delete recent records", async () => {
+    await upsertJobState("test-7", { jobName: "execute_hedge", phase: "delivered" });
 
-    const deleted = cleanupOldJobs(30);
+    const deleted = await cleanupOldJobs(30);
     expect(deleted).toBe(0);
 
-    const state = getJobState("test-7");
+    const state = await getJobState("test-7");
     expect(state).not.toBeNull();
   });
 
-  test("upsertJobState stores buyer address", () => {
-    upsertJobState("test-8", {
+  test("upsertJobState stores buyer address", async () => {
+    await upsertJobState("test-8", {
       jobName: "close_hedge",
       phase: "initialized",
       buyerAddress: "0xABC123",
     });
 
-    const state = getJobState("test-8");
+    const state = await getJobState("test-8");
     expect(state!.buyer_address).toBe("0xABC123");
   });
 
-  test("full confirmation flow lifecycle", () => {
+  test("full confirmation flow lifecycle", async () => {
     // 1. Initialize
-    upsertJobState("test-flow", { jobName: "execute_hedge", phase: "initialized", buyerAddress: "0xBuyer" });
-    expect(getJobState("test-flow")!.phase).toBe("initialized");
+    await upsertJobState("test-flow", { jobName: "execute_hedge", phase: "initialized", buyerAddress: "0xBuyer" });
+    expect((await getJobState("test-flow"))!.phase).toBe("initialized");
 
     // 2. Send confirmation
     const plan = JSON.stringify({ budget: 50 });
-    setConfirmationSent("test-flow", plan);
-    const afterConfSent = getJobState("test-flow")!;
+    await setConfirmationSent("test-flow", plan);
+    const afterConfSent = (await getJobState("test-flow"))!;
     expect(afterConfSent.phase).toBe("awaiting_confirmation");
     expect(afterConfSent.confirmation_sent).toBe(1);
     expect(afterConfSent.confirmation_payload).toBe(plan);
 
     // 3. Buyer confirms
-    setConfirmed("test-flow");
-    expect(getJobState("test-flow")!.phase).toBe("confirmed");
+    await setConfirmed("test-flow");
+    expect((await getJobState("test-flow"))!.phase).toBe("confirmed");
 
     // 4. Delivered
-    setDelivered("test-flow");
-    expect(getJobState("test-flow")!.phase).toBe("delivered");
+    await setDelivered("test-flow");
+    expect((await getJobState("test-flow"))!.phase).toBe("delivered");
   });
 });
 

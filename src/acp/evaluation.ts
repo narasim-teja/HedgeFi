@@ -48,7 +48,7 @@ export async function verifyDeliverable(job: AcpJob): Promise<EvaluationResult> 
       case "execute_hedge":
         return await verifyExecuteHedge(jobId, deliverable);
       case "close_hedge":
-        return verifyCloseHedge(jobId, deliverable);
+        return await verifyCloseHedge(jobId, deliverable);
       default:
         return { approved: true, reason: `Unknown job type ${jobName}, auto-approved` };
     }
@@ -148,7 +148,7 @@ async function verifyExecuteHedge(
   }
 
   // Verify budget usage is reasonable
-  const jobState = getJobState(jobId);
+  const jobState = await getJobState(jobId);
   if (jobState?.confirmation_payload && d.summary.total_spent !== undefined) {
     try {
       const plan = JSON.parse(jobState.confirmation_payload);
@@ -173,10 +173,10 @@ async function verifyExecuteHedge(
 // close_hedge verification
 // =============================================
 
-function verifyCloseHedge(
+async function verifyCloseHedge(
   jobId: string,
   deliverable: unknown
-): EvaluationResult {
+): Promise<EvaluationResult> {
   const d = deliverable as Partial<CloseHedgeDeliverable>;
 
   if (!d.positions_closed || !Array.isArray(d.positions_closed)) {
@@ -184,9 +184,9 @@ function verifyCloseHedge(
   }
 
   // Verify DB positions are marked as closed
-  const jobState = getJobState(jobId);
+  const jobState = await getJobState(jobId);
   if (jobState?.buyer_address) {
-    const activePositions = getActivePositions(jobState.buyer_address);
+    const activePositions = await getActivePositions(jobState.buyer_address);
     if (activePositions.length > 0 && d.positions_closed.length > 0) {
       // Some positions still active — could be partial close
       log.info(

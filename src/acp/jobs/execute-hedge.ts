@@ -223,7 +223,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
   jlog.info("Requirement parsed", req);
 
   // Track job state
-  upsertJobState(String(job.id), {
+  await upsertJobState(String(job.id), {
     jobName: "execute_hedge",
     phase: "initialized",
     buyerAddress: job.clientAddress,
@@ -232,7 +232,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
   // Budget cap check (testing phase safety)
   if (req.hedge_budget_usdc > MAX_HEDGE_BUDGET_USD) {
     jlog.warn(`Budget $${req.hedge_budget_usdc} exceeds testing cap $${MAX_HEDGE_BUDGET_USD}`);
-    setFailed(String(job.id));
+    await setFailed(String(job.id));
     return {
       type: "error",
       message: `Budget cap: $${MAX_HEDGE_BUDGET_USD} max during testing phase. Requested: $${req.hedge_budget_usdc}. Please reduce your budget.`,
@@ -253,7 +253,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
     // Edge case: stablecoin-only portfolio
     if (isStablecoinOnly(exposure)) {
       jlog.info("Portfolio is stablecoin-only, cannot hedge");
-      setFailed(String(job.id));
+      await setFailed(String(job.id));
       const reasoning = generateEdgeCaseMessage("stablecoins_only", { totalValue: exposure.total_value_usd });
       return { type: "error", message: reasoning };
     }
@@ -271,7 +271,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
     // Edge case: no markets available
     if (scoredMarkets.length === 0) {
       jlog.info("No hedging markets found");
-      setFailed(String(job.id));
+      await setFailed(String(job.id));
       const topNonStable = exposure.tokens.find((t) => !STABLECOIN_SYMBOLS.has(t.symbol));
       const timeframeNote = timeframe !== "all"
         ? ` No ${timeframe} markets are currently available. Try a different timeframe or "all".`
@@ -291,7 +291,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
 
     if (recommendations.length === 0) {
       jlog.info("No viable recommendations after sizing");
-      setFailed(String(job.id));
+      await setFailed(String(job.id));
       return { type: "error", message: "No viable hedge positions could be constructed within your budget and risk parameters." };
     }
 
@@ -329,7 +329,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
     };
 
     // Store the frozen plan for execution after buyer pays
-    setConfirmationSent(String(job.id), JSON.stringify(plan));
+    await setConfirmationSent(String(job.id), JSON.stringify(plan));
 
     // Return the formatted plan text — caller will pass to createRequirement
     const confirmationMsg = formatConfirmationMessage(plan);
@@ -338,7 +338,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
 
   } catch (err) {
     jlog.error("Failed during hedge analysis phase", err);
-    setFailed(String(job.id));
+    await setFailed(String(job.id));
     return {
       type: "error",
       message: `Hedge analysis failed: ${err instanceof Error ? err.message : "Unknown error"}. Please try again.`,
@@ -358,7 +358,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
 
   // Retrieve the frozen plan from job state
   const { getJobState } = await import("../../db/job-state.ts");
-  const state = getJobState(String(job.id));
+  const state = await getJobState(String(job.id));
   if (!state?.confirmation_payload) {
     jlog.error("No confirmation payload found for confirmed job");
     await rejectWithRefund(job, jlog, "Internal error: hedge plan not found. Please retry.", req.hedge_budget_usdc);
@@ -374,7 +374,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
     return;
   }
 
-  upsertJobState(String(job.id), { jobName: "execute_hedge", phase: "executing" });
+  await upsertJobState(String(job.id), { jobName: "execute_hedge", phase: "executing" });
 
   try {
     // Pre-check: verify agent wallet has enough USDC to cover the budget
@@ -388,7 +388,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
           `Insufficient agent liquidity ($${agentBalance.toFixed(2)} available) for requested budget ($${req.hedge_budget_usdc}). Please try again later or reduce budget.`,
           req.hedge_budget_usdc
         );
-        setFailed(String(job.id));
+        await setFailed(String(job.id));
         return;
       }
     } catch (balErr) {
@@ -468,7 +468,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
 
         // Record in database
         const buyerAddress = job.clientAddress ?? "unknown";
-        const positionId = createPosition({
+        const positionId = await createPosition({
           jobId: String(job.id),
           buyerAddress,
           marketSlug,
@@ -484,7 +484,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
           venueExchange,
         });
 
-        recordOrder({
+        await recordOrder({
           positionId,
           orderType: "open",
           marketSlug,
@@ -569,7 +569,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
 
         if (result.totalCost > 0) {
           const buyerAddress = job.clientAddress ?? "unknown";
-          const positionId = createPosition({
+          const positionId = await createPosition({
             jobId: String(job.id),
             buyerAddress,
             marketSlug: retrySlug,
@@ -585,7 +585,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
             venueExchange,
           });
 
-          recordOrder({
+          await recordOrder({
             positionId,
             orderType: "open",
             marketSlug: retrySlug,
@@ -629,7 +629,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
     // If all orders failed but we had recommendations, refund
     if (hedges_placed.length === 0 && recommendations.length > 0) {
       jlog.warn(`All ${recommendations.length} orders failed to fill`);
-      setFailed(String(job.id));
+      await setFailed(String(job.id));
       await rejectWithRefund(
         job, jlog,
         "All hedge orders failed to execute on Limitless Exchange. No positions were opened. Full refund issued.",
@@ -698,7 +698,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
       await job.deliver(JSON.stringify(deliverable));
       jlog.info("Delivered (full budget deployed)");
     }
-    setDelivered(String(job.id));
+    await setDelivered(String(job.id));
 
     // Notification memo
     try {
@@ -710,7 +710,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
     }
   } catch (err) {
     jlog.error("Failed during hedge execution phase", err);
-    setFailed(String(job.id));
+    await setFailed(String(job.id));
 
     try {
       const payable = job.netPayableAmount;

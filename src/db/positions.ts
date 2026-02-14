@@ -1,35 +1,39 @@
-import { db } from "./schema.ts";
+import { sql } from "./schema.ts";
 import { createLogger } from "../utils/logger.ts";
 import type { DbPosition, CreatePositionParams, ClosingData } from "../utils/types.ts";
 
 const log = createLogger("db-positions");
 
+function toISOString(val: unknown): string | null {
+  if (val instanceof Date) return val.toISOString();
+  if (typeof val === "string") return val;
+  return null;
+}
+
+function normalizePosition(row: Record<string, unknown> | undefined): DbPosition | null {
+  if (!row) return null;
+  return {
+    ...(row as unknown as DbPosition),
+    created_at: toISOString(row.created_at) ?? "",
+    closed_at: toISOString(row.closed_at),
+    expiry: (typeof row.expiry === "string" ? row.expiry : toISOString(row.expiry)) ?? "",
+  };
+}
+
+function normalizePositions(rows: Record<string, unknown>[]): DbPosition[] {
+  return rows.map((r) => normalizePosition(r)!);
+}
+
 /**
  * Create a new position record after a hedge order fills.
  */
-export function createPosition(params: CreatePositionParams): string {
+export async function createPosition(params: CreatePositionParams): Promise<string> {
   const id = `pos_${crypto.randomUUID()}`;
 
-  db.run(
-    `INSERT INTO positions (id, job_id, buyer_address, market_slug, market_title, token_id, side, action, shares, entry_price, total_cost_usdc, order_id, status, expiry, venue_exchange)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)`,
-    [
-      id,
-      params.jobId,
-      params.buyerAddress,
-      params.marketSlug,
-      params.marketTitle,
-      params.tokenId,
-      params.side,
-      params.action,
-      params.shares,
-      params.entryPrice,
-      params.totalCostUsdc,
-      params.orderId,
-      params.expiry,
-      params.venueExchange,
-    ]
-  );
+  await sql`
+    INSERT INTO positions (id, job_id, buyer_address, market_slug, market_title, token_id, side, action, shares, entry_price, total_cost_usdc, order_id, status, expiry, venue_exchange)
+    VALUES (${id}, ${params.jobId}, ${params.buyerAddress}, ${params.marketSlug}, ${params.marketTitle}, ${params.tokenId}, ${params.side}, ${params.action}, ${params.shares}, ${params.entryPrice}, ${params.totalCostUsdc}, ${params.orderId}, 'active', ${params.expiry}, ${params.venueExchange})
+  `;
 
   log.info(`Created position ${id}`, { marketSlug: params.marketSlug, shares: params.shares });
   return id;
@@ -38,45 +42,45 @@ export function createPosition(params: CreatePositionParams): string {
 /**
  * Get all active positions for a specific buyer.
  */
-export function getActivePositions(buyerAddress: string): DbPosition[] {
-  return db
-    .query("SELECT * FROM positions WHERE buyer_address = ? AND status = 'active' ORDER BY created_at DESC")
-    .all(buyerAddress) as DbPosition[];
+export async function getActivePositions(buyerAddress: string): Promise<DbPosition[]> {
+  const rows = await sql`
+    SELECT * FROM positions WHERE buyer_address = ${buyerAddress} AND status = 'active' ORDER BY created_at DESC
+  `;
+  return normalizePositions(rows as Record<string, unknown>[]);
 }
 
 /**
  * Get all active positions across all buyers.
  */
-export function getAllActivePositions(): DbPosition[] {
-  return db
-    .query("SELECT * FROM positions WHERE status = 'active' ORDER BY created_at DESC")
-    .all() as DbPosition[];
+export async function getAllActivePositions(): Promise<DbPosition[]> {
+  const rows = await sql`
+    SELECT * FROM positions WHERE status = 'active' ORDER BY created_at DESC
+  `;
+  return normalizePositions(rows as Record<string, unknown>[]);
 }
 
 /**
  * Get a position by ID.
  */
-export function getPosition(positionId: string): DbPosition | null {
-  return db
-    .query("SELECT * FROM positions WHERE id = ?")
-    .get(positionId) as DbPosition | null;
+export async function getPosition(positionId: string): Promise<DbPosition | null> {
+  const rows = await sql`SELECT * FROM positions WHERE id = ${positionId}`;
+  return normalizePosition(rows[0] as Record<string, unknown> | undefined);
 }
 
 /**
  * Update position status (e.g., closed, expired, won, lost).
  */
-export function updatePositionStatus(
+export async function updatePositionStatus(
   positionId: string,
   status: string,
   closingData?: ClosingData
-): void {
+): Promise<void> {
   if (closingData) {
-    db.run(
-      "UPDATE positions SET status = ?, closed_at = datetime('now'), close_price = ?, realized_pnl = ? WHERE id = ?",
-      [status, closingData.closePrice, closingData.realizedPnl, positionId]
-    );
+    await sql`
+      UPDATE positions SET status = ${status}, closed_at = NOW(), close_price = ${closingData.closePrice}, realized_pnl = ${closingData.realizedPnl} WHERE id = ${positionId}
+    `;
   } else {
-    db.run("UPDATE positions SET status = ? WHERE id = ?", [status, positionId]);
+    await sql`UPDATE positions SET status = ${status} WHERE id = ${positionId}`;
   }
 
   log.info(`Updated position ${positionId} → ${status}`);
@@ -85,25 +89,27 @@ export function updatePositionStatus(
 /**
  * Get positions for a specific market.
  */
-export function getPositionsForMarket(marketSlug: string): DbPosition[] {
-  return db
-    .query("SELECT * FROM positions WHERE market_slug = ? ORDER BY created_at DESC")
-    .all(marketSlug) as DbPosition[];
+export async function getPositionsForMarket(marketSlug: string): Promise<DbPosition[]> {
+  const rows = await sql`
+    SELECT * FROM positions WHERE market_slug = ${marketSlug} ORDER BY created_at DESC
+  `;
+  return normalizePositions(rows as Record<string, unknown>[]);
 }
 
 /**
  * Get historical (closed/resolved) positions for a specific buyer.
  */
-export function getHistoricalPositions(buyerAddress: string): DbPosition[] {
-  return db
-    .query("SELECT * FROM positions WHERE buyer_address = ? AND status != 'active' ORDER BY closed_at DESC")
-    .all(buyerAddress) as DbPosition[];
+export async function getHistoricalPositions(buyerAddress: string): Promise<DbPosition[]> {
+  const rows = await sql`
+    SELECT * FROM positions WHERE buyer_address = ${buyerAddress} AND status != 'active' ORDER BY closed_at DESC
+  `;
+  return normalizePositions(rows as Record<string, unknown>[]);
 }
 
 /**
  * Record an order in the history table.
  */
-export function recordOrder(params: {
+export async function recordOrder(params: {
   positionId: string | null;
   orderType: string;
   marketSlug: string;
@@ -114,24 +120,11 @@ export function recordOrder(params: {
   filledSize: number | null;
   orderId: string;
   status: string;
-}): void {
+}): Promise<void> {
   const id = `ord_${crypto.randomUUID()}`;
 
-  db.run(
-    `INSERT INTO order_history (id, position_id, order_type, market_slug, side, maker_amount, taker_amount, price, filled_size, order_id, status)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [
-      id,
-      params.positionId,
-      params.orderType,
-      params.marketSlug,
-      params.side,
-      params.makerAmount,
-      params.takerAmount,
-      params.price,
-      params.filledSize,
-      params.orderId,
-      params.status,
-    ]
-  );
+  await sql`
+    INSERT INTO order_history (id, position_id, order_type, market_slug, side, maker_amount, taker_amount, price, filled_size, order_id, status)
+    VALUES (${id}, ${params.positionId}, ${params.orderType}, ${params.marketSlug}, ${params.side}, ${params.makerAmount}, ${params.takerAmount}, ${params.price}, ${params.filledSize}, ${params.orderId}, ${params.status})
+  `;
 }

@@ -88,18 +88,17 @@ function formatExpiryHuman(expiryIso: string): string {
 /**
  * Look up positions to close based on the requirement.
  */
-function resolvePositions(req: CloseHedgeRequirement, buyerAddress: string): DbPosition[] {
+async function resolvePositions(req: CloseHedgeRequirement, buyerAddress: string): Promise<DbPosition[]> {
   if (req.position_ids && req.position_ids.length > 0) {
-    return req.position_ids
-      .map((id) => getPosition(id))
-      .filter((p): p is DbPosition => p !== null && p.status === "active");
+    const results = await Promise.all(req.position_ids.map((id) => getPosition(id)));
+    return results.filter((p): p is DbPosition => p !== null && p.status === "active");
   }
 
   if (req.close_all) {
-    return getActivePositions(buyerAddress);
+    return await getActivePositions(buyerAddress);
   }
 
-  return getActivePositions(buyerAddress);
+  return await getActivePositions(buyerAddress);
 }
 
 /**
@@ -154,7 +153,7 @@ export async function handleCloseHedgePreview(job: AcpJob): Promise<AnalysisResu
   const req = parseRequirement(job);
   jlog.info("Requirement parsed", req);
 
-  upsertJobState(String(job.id), {
+  await upsertJobState(String(job.id), {
     jobName: "close_hedge",
     phase: "initialized",
     buyerAddress: job.clientAddress,
@@ -162,7 +161,7 @@ export async function handleCloseHedgePreview(job: AcpJob): Promise<AnalysisResu
 
   try {
     const buyerAddress = job.clientAddress ?? "unknown";
-    const positions = resolvePositions(req, buyerAddress);
+    const positions = await resolvePositions(req, buyerAddress);
 
     // No positions to close
     if (positions.length === 0) {
@@ -210,7 +209,7 @@ export async function handleCloseHedgePreview(job: AcpJob): Promise<AnalysisResu
     };
 
     // Store the plan for execution after buyer pays
-    setConfirmationSent(String(job.id), JSON.stringify(plan));
+    await setConfirmationSent(String(job.id), JSON.stringify(plan));
 
     // Return the formatted preview text — caller will pass to createRequirement
     const confirmationMsg = formatCloseConfirmationMessage(plan);
@@ -219,7 +218,7 @@ export async function handleCloseHedgePreview(job: AcpJob): Promise<AnalysisResu
 
   } catch (err) {
     jlog.error("Failed during close hedge preview", err);
-    setFailed(String(job.id));
+    await setFailed(String(job.id));
     return {
       type: "error",
       message: `Close hedge preview failed: ${err instanceof Error ? err.message : "Unknown error"}`,
@@ -239,7 +238,7 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
 
   // Retrieve the stored plan
   const { getJobState } = await import("../../db/job-state.ts");
-  const state = getJobState(String(job.id));
+  const state = await getJobState(String(job.id));
 
   // Even without a stored plan, proceed — resolve positions directly
   let positionIds: string[] | undefined;
@@ -252,14 +251,15 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
     }
   }
 
-  upsertJobState(String(job.id), { jobName: "close_hedge", phase: "executing" });
+  await upsertJobState(String(job.id), { jobName: "close_hedge", phase: "executing" });
 
   try {
     const buyerAddress = job.clientAddress ?? "unknown";
     let positions: DbPosition[];
 
     if (positionIds && positionIds.length > 0) {
-      const lookups = positionIds.map((id) => ({ id, pos: getPosition(id) }));
+      const posResults = await Promise.all(positionIds.map(async (id) => ({ id, pos: await getPosition(id) })));
+      const lookups = posResults;
       const notFound = lookups.filter((l) => l.pos === null);
       const alreadyClosed = lookups.filter((l) => l.pos !== null && l.pos.status !== "active");
 
@@ -274,7 +274,7 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
         .map((l) => l.pos)
         .filter((p): p is DbPosition => p !== null && p.status === "active");
     } else {
-      positions = resolvePositions(req, buyerAddress);
+      positions = await resolvePositions(req, buyerAddress);
     }
 
     if (positions.length === 0) {
@@ -286,7 +286,7 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
         reasoning: "No active hedge positions were found to close. Positions may have already been closed or expired.",
       };
       await job.deliver(JSON.stringify(deliverable));
-      setDelivered(String(job.id));
+      await setDelivered(String(job.id));
       try { await job.createNotification("No active positions found to close."); } catch { /* non-fatal */ }
       return;
     }
@@ -320,7 +320,7 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
       if (totalShares <= 0) {
         jlog.warn(`Position group on ${representative.market_slug} has zero total shares, skipping`);
         for (const pos of group) {
-          updatePositionStatus(pos.id, "close_failed");
+          await updatePositionStatus(pos.id, "close_failed");
         }
         continue;
       }
@@ -349,12 +349,12 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
           const posReturn = sanitizeNumber(saleAmount * sharesFraction);
           const posPnl = sanitizeNumber(posReturn - pos.total_cost_usdc);
 
-          updatePositionStatus(pos.id, "closed", {
+          await updatePositionStatus(pos.id, "closed", {
             closePrice: result.avgPrice,
             realizedPnl: Math.round(posPnl * 100) / 100,
           });
 
-          recordOrder({
+          await recordOrder({
             positionId: pos.id,
             orderType: "close",
             marketSlug: pos.market_slug,
@@ -387,7 +387,7 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
       } catch (err) {
         jlog.error(`Failed to close ${group.length} position(s) on ${representative.market_slug}`, err);
         for (const pos of group) {
-          updatePositionStatus(pos.id, "close_failed");
+          await updatePositionStatus(pos.id, "close_failed");
         }
       }
     }
@@ -439,7 +439,7 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
       await job.deliver(JSON.stringify(deliverable));
       jlog.info("Delivered (no funds to return)");
     }
-    setDelivered(String(job.id));
+    await setDelivered(String(job.id));
 
     // Post-delivery notification memo (summary only, funds already returned above)
     try {
@@ -451,7 +451,7 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
     }
   } catch (err) {
     jlog.error("Failed during close hedge execution", err);
-    setFailed(String(job.id));
+    await setFailed(String(job.id));
 
     try {
       const payable = job.netPayableAmount;

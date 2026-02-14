@@ -55,13 +55,13 @@ function formatActivePosition(pos: DbPosition) {
   };
 }
 
-function handleActivePositions(url: URL): Response {
+async function handleActivePositions(url: URL): Promise<Response> {
   const clientAddress = url.searchParams.get("clientAddress");
   if (!clientAddress) {
     return errorResponse("Missing required query parameter: clientAddress");
   }
 
-  const positions = getActivePositions(clientAddress);
+  const positions = await getActivePositions(clientAddress);
 
   return jsonResponse({
     clientAddress,
@@ -118,13 +118,13 @@ function formatHistoricalPosition(pos: DbPosition) {
   };
 }
 
-function handleHistoricalPositions(url: URL): Response {
+async function handleHistoricalPositions(url: URL): Promise<Response> {
   const clientAddress = url.searchParams.get("clientAddress");
   if (!clientAddress) {
     return errorResponse("Missing required query parameter: clientAddress");
   }
 
-  const positions = getHistoricalPositions(clientAddress);
+  const positions = await getHistoricalPositions(clientAddress);
 
   return jsonResponse({
     clientAddress,
@@ -269,7 +269,7 @@ export function startResourceServer(): void {
         case "/status": {
           let activeCount = 0;
           try {
-            activeCount = getAllActivePositions().length;
+            activeCount = (await getAllActivePositions()).length;
           } catch { /* fallback to 0 */ }
           return jsonResponse({
             agent: "HedgeFi",

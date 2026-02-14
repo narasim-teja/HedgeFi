@@ -10,6 +10,11 @@ export function validateEnvironment(): void {
     description: string;
   }> = [
     {
+      name: "DATABASE_URL",
+      pattern: /^postgres(ql)?:\/\//,
+      description: "PostgreSQL connection string (e.g. postgresql://user:pass@host:5432/db)",
+    },
+    {
       name: "HEDGEFI_PRIVATE_KEY",
       pattern: /^0x[0-9a-fA-F]{64}$/,
       description: "64-char hex private key (0x-prefixed)",

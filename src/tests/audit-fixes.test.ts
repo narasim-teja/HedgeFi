@@ -1,5 +1,5 @@
 import { test, expect, describe, beforeEach, afterEach } from "bun:test";
-import { db } from "../db/schema.ts";
+import { sql } from "../db/schema.ts";
 
 // =============================================
 // 1. Per-buyer concurrency lock
@@ -107,16 +107,18 @@ describe("Position isolation (security fix)", () => {
   const buyerA = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
   const buyerB = "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
 
-  beforeEach(() => {
-    db.run("DELETE FROM positions WHERE buyer_address IN (?, ?)", [buyerA, buyerB]);
+  beforeEach(async () => {
+    await sql`DELETE FROM order_history WHERE position_id IN (SELECT id FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB}))`;
+    await sql`DELETE FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB})`;
   });
 
-  afterEach(() => {
-    db.run("DELETE FROM positions WHERE buyer_address IN (?, ?)", [buyerA, buyerB]);
+  afterEach(async () => {
+    await sql`DELETE FROM order_history WHERE position_id IN (SELECT id FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB}))`;
+    await sql`DELETE FROM positions WHERE buyer_address IN (${buyerA}, ${buyerB})`;
   });
 
-  function createTestPosition(buyerAddress: string, slug: string) {
-    return createPosition({
+  async function createTestPosition(buyerAddress: string, slug: string) {
+    return await createPosition({
       jobId: "test-job",
       buyerAddress,
       marketSlug: slug,
@@ -133,13 +135,13 @@ describe("Position isolation (security fix)", () => {
     });
   }
 
-  test("getActivePositions only returns positions for the specified buyer", () => {
-    createTestPosition(buyerA, "market-1");
-    createTestPosition(buyerA, "market-2");
-    createTestPosition(buyerB, "market-3");
+  test("getActivePositions only returns positions for the specified buyer", async () => {
+    await createTestPosition(buyerA, "market-1");
+    await createTestPosition(buyerA, "market-2");
+    await createTestPosition(buyerB, "market-3");
 
-    const positionsA = getActivePositions(buyerA);
-    const positionsB = getActivePositions(buyerB);
+    const positionsA = await getActivePositions(buyerA);
+    const positionsB = await getActivePositions(buyerB);
 
     expect(positionsA.length).toBe(2);
     expect(positionsB.length).toBe(1);
@@ -147,33 +149,33 @@ describe("Position isolation (security fix)", () => {
     expect(positionsB.every((p) => p.buyer_address === buyerB)).toBe(true);
   });
 
-  test("getActivePositions returns empty for unknown buyer", () => {
-    createTestPosition(buyerA, "market-1");
+  test("getActivePositions returns empty for unknown buyer", async () => {
+    await createTestPosition(buyerA, "market-1");
 
-    const positionsUnknown = getActivePositions("0xNONEXISTENT");
+    const positionsUnknown = await getActivePositions("0xNONEXISTENT");
     expect(positionsUnknown.length).toBe(0);
   });
 
-  test("getAllActivePositions returns all buyers positions (admin only)", () => {
-    createTestPosition(buyerA, "market-1");
-    createTestPosition(buyerB, "market-2");
+  test("getAllActivePositions returns all buyers positions (admin only)", async () => {
+    await createTestPosition(buyerA, "market-1");
+    await createTestPosition(buyerB, "market-2");
 
-    const all = getAllActivePositions();
+    const all = await getAllActivePositions();
     expect(all.length).toBeGreaterThanOrEqual(2);
   });
 
-  test("position IDs use crypto.randomUUID format", () => {
-    const id = createTestPosition(buyerA, "market-uuid");
+  test("position IDs use crypto.randomUUID format", async () => {
+    const id = await createTestPosition(buyerA, "market-uuid");
     // Format: pos_<uuid>
     expect(id).toMatch(/^pos_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
   });
 
-  test("order IDs use crypto.randomUUID format", () => {
-    const posId = createTestPosition(buyerA, "market-ord");
+  test("order IDs use crypto.randomUUID format", async () => {
+    const posId = await createTestPosition(buyerA, "market-ord");
 
     // We can't easily inspect the order ID from recordOrder (void return),
     // but we can verify the position was created with the right format
-    recordOrder({
+    await recordOrder({
       positionId: posId,
       orderType: "open",
       marketSlug: "market-ord",
@@ -187,14 +189,15 @@ describe("Position isolation (security fix)", () => {
     });
 
     // Query the order directly to check ID format
-    const order = db.query("SELECT id FROM order_history WHERE position_id = ?").get(posId) as { id: string } | null;
-    expect(order).not.toBeNull();
+    const rows = await sql`SELECT id FROM order_history WHERE position_id = ${posId}`;
+    const order = rows[0] as { id: string } | undefined;
+    expect(order).not.toBeUndefined();
     expect(order!.id).toMatch(/^ord_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
   });
 
-  test("two position IDs are always unique", () => {
-    const id1 = createTestPosition(buyerA, "market-u1");
-    const id2 = createTestPosition(buyerA, "market-u2");
+  test("two position IDs are always unique", async () => {
+    const id1 = await createTestPosition(buyerA, "market-u1");
+    const id2 = await createTestPosition(buyerA, "market-u2");
     expect(id1).not.toBe(id2);
   });
 });
@@ -211,58 +214,55 @@ import {
 } from "../db/job-state.ts";
 
 describe("recoverStuckJobs", () => {
-  beforeEach(() => {
-    db.run("DELETE FROM job_state WHERE job_id LIKE 'test-stuck-%'");
+  beforeEach(async () => {
+    await sql`DELETE FROM job_state WHERE job_id LIKE 'test-stuck-%'`;
   });
 
-  afterEach(() => {
-    db.run("DELETE FROM job_state WHERE job_id LIKE 'test-stuck-%'");
+  afterEach(async () => {
+    await sql`DELETE FROM job_state WHERE job_id LIKE 'test-stuck-%'`;
   });
 
-  test("marks stuck 'executing' jobs as failed", () => {
+  test("marks stuck 'executing' jobs as failed", async () => {
     // Create a job in "executing" with started_at in the past
-    upsertJobState("test-stuck-1", { jobName: "execute_hedge", phase: "initialized" });
-    upsertJobState("test-stuck-1", { jobName: "execute_hedge", phase: "executing" });
+    await upsertJobState("test-stuck-1", { jobName: "execute_hedge", phase: "initialized" });
+    await upsertJobState("test-stuck-1", { jobName: "execute_hedge", phase: "executing" });
 
     // Manually backdate started_at to 20 minutes ago
-    db.run(
-      "UPDATE job_state SET started_at = datetime('now', '-20 minutes') WHERE job_id = ?",
-      ["test-stuck-1"]
-    );
+    await sql`UPDATE job_state SET started_at = NOW() - INTERVAL '20 minutes' WHERE job_id = ${"test-stuck-1"}`;
 
-    const recovered = recoverStuckJobs(10);
+    const recovered = await recoverStuckJobs(10);
     expect(recovered).toBeGreaterThanOrEqual(1);
 
-    const state = getJobState("test-stuck-1");
+    const state = await getJobState("test-stuck-1");
     expect(state!.phase).toBe("failed");
   });
 
-  test("does NOT mark recently started executing jobs as failed", () => {
-    upsertJobState("test-stuck-2", { jobName: "execute_hedge", phase: "initialized" });
-    upsertJobState("test-stuck-2", { jobName: "execute_hedge", phase: "executing" });
+  test("does NOT mark recently started executing jobs as failed", async () => {
+    await upsertJobState("test-stuck-2", { jobName: "execute_hedge", phase: "initialized" });
+    await upsertJobState("test-stuck-2", { jobName: "execute_hedge", phase: "executing" });
 
     // started_at is set to "now" — should not be recovered
-    const recovered = recoverStuckJobs(10);
+    const recovered = await recoverStuckJobs(10);
 
-    const state = getJobState("test-stuck-2");
+    const state = await getJobState("test-stuck-2");
     expect(state!.phase).toBe("executing");
   });
 
-  test("does NOT affect jobs in other phases", () => {
-    upsertJobState("test-stuck-3", { jobName: "execute_hedge", phase: "delivered" });
+  test("does NOT affect jobs in other phases", async () => {
+    await upsertJobState("test-stuck-3", { jobName: "execute_hedge", phase: "delivered" });
 
-    const recovered = recoverStuckJobs(10);
-    const state = getJobState("test-stuck-3");
+    const recovered = await recoverStuckJobs(10);
+    const state = await getJobState("test-stuck-3");
     expect(state!.phase).toBe("delivered");
   });
 
-  test("upsertJobState sets started_at when phase is 'executing'", () => {
-    upsertJobState("test-stuck-4", { jobName: "execute_hedge", phase: "initialized" });
-    const before = getJobState("test-stuck-4");
+  test("upsertJobState sets started_at when phase is 'executing'", async () => {
+    await upsertJobState("test-stuck-4", { jobName: "execute_hedge", phase: "initialized" });
+    const before = await getJobState("test-stuck-4");
     expect(before!.started_at).toBeNull();
 
-    upsertJobState("test-stuck-4", { jobName: "execute_hedge", phase: "executing" });
-    const after = getJobState("test-stuck-4");
+    await upsertJobState("test-stuck-4", { jobName: "execute_hedge", phase: "executing" });
+    const after = await getJobState("test-stuck-4");
     expect(after!.started_at).not.toBeNull();
   });
 });
@@ -468,9 +468,9 @@ describe("RateLimiter (audit)", () => {
 // =============================================
 
 describe("Schema: started_at column exists", () => {
-  test("job_state table has started_at column", () => {
-    const info = db.query("PRAGMA table_info(job_state)").all() as Array<{ name: string }>;
-    const columnNames = info.map((c) => c.name);
+  test("job_state table has started_at column", async () => {
+    const info = await sql`SELECT column_name as name FROM information_schema.columns WHERE table_name = 'job_state'`;
+    const columnNames = (info as Array<{ name: string }>).map((c) => c.name);
     expect(columnNames).toContain("started_at");
   });
 });
