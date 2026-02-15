@@ -16,6 +16,7 @@ export type AnalysisResult =
 
 export interface HedgeAnalysisRequirement {
   wallet_address: string;
+  additional_addresses?: string[];
   chain: "base" | "ethereum" | "arbitrum";
   risk_tolerance: "conservative" | "moderate" | "aggressive";
   hedge_budget: number;
@@ -61,6 +62,7 @@ export interface HedgeAnalysisDeliverable {
 
 export interface ExecuteHedgeRequirement {
   wallet_address: string;
+  additional_addresses?: string[];
   chain: "base" | "ethereum" | "arbitrum";
   risk_tolerance: "conservative" | "moderate" | "aggressive";
   hedge_budget_usdc: number;
@@ -337,6 +339,7 @@ export interface DbPosition {
   id: string;
   job_id: string;
   buyer_address: string;
+  target_wallet: string | null;
   market_slug: string;
   market_title: string;
   token_id: string;
@@ -358,6 +361,7 @@ export interface DbPosition {
 export interface CreatePositionParams {
   jobId: string;
   buyerAddress: string;
+  targetWallet: string;
   marketSlug: string;
   marketTitle: string;
   tokenId: string;

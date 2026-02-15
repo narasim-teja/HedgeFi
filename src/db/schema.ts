@@ -15,6 +15,7 @@ export async function initSchema(): Promise<void> {
       id TEXT PRIMARY KEY,
       job_id TEXT NOT NULL,
       buyer_address TEXT NOT NULL,
+      target_wallet TEXT,
       market_slug TEXT NOT NULL,
       market_title TEXT NOT NULL,
       token_id TEXT NOT NULL,
@@ -65,6 +66,13 @@ export async function initSchema(): Promise<void> {
       updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
     )
   `;
+
+  // Migration: add target_wallet to existing positions tables
+  try {
+    await sql`ALTER TABLE positions ADD COLUMN IF NOT EXISTS target_wallet TEXT`;
+  } catch {
+    // Column already exists or DB doesn't support IF NOT EXISTS — safe to ignore
+  }
 
   log.info("Database schema initialized");
 }

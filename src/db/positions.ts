@@ -31,8 +31,8 @@ export async function createPosition(params: CreatePositionParams): Promise<stri
   const id = `pos_${crypto.randomUUID()}`;
 
   await getDb()`
-    INSERT INTO positions (id, job_id, buyer_address, market_slug, market_title, token_id, side, action, shares, entry_price, total_cost_usdc, order_id, status, expiry, venue_exchange)
-    VALUES (${id}, ${params.jobId}, ${params.buyerAddress}, ${params.marketSlug}, ${params.marketTitle}, ${params.tokenId}, ${params.side}, ${params.action}, ${params.shares}, ${params.entryPrice}, ${params.totalCostUsdc}, ${params.orderId}, 'active', ${params.expiry}, ${params.venueExchange})
+    INSERT INTO positions (id, job_id, buyer_address, target_wallet, market_slug, market_title, token_id, side, action, shares, entry_price, total_cost_usdc, order_id, status, expiry, venue_exchange)
+    VALUES (${id}, ${params.jobId}, ${params.buyerAddress}, ${params.targetWallet}, ${params.marketSlug}, ${params.marketTitle}, ${params.tokenId}, ${params.side}, ${params.action}, ${params.shares}, ${params.entryPrice}, ${params.totalCostUsdc}, ${params.orderId}, 'active', ${params.expiry}, ${params.venueExchange})
   `;
 
   log.info(`Created position ${id}`, { marketSlug: params.marketSlug, shares: params.shares });
@@ -40,12 +40,16 @@ export async function createPosition(params: CreatePositionParams): Promise<stri
 }
 
 /**
- * Get all active positions for a specific buyer.
+ * Get all active positions for a specific buyer, optionally filtered by target wallet.
  */
-export async function getActivePositions(buyerAddress: string): Promise<DbPosition[]> {
-  const rows = await getDb()`
-    SELECT * FROM positions WHERE buyer_address = ${buyerAddress} AND status = 'active' ORDER BY created_at DESC
-  `;
+export async function getActivePositions(buyerAddress: string, targetWallet?: string): Promise<DbPosition[]> {
+  const rows = targetWallet
+    ? await getDb()`
+        SELECT * FROM positions WHERE buyer_address = ${buyerAddress} AND target_wallet = ${targetWallet} AND status = 'active' ORDER BY created_at DESC
+      `
+    : await getDb()`
+        SELECT * FROM positions WHERE buyer_address = ${buyerAddress} AND status = 'active' ORDER BY created_at DESC
+      `;
   return normalizePositions(rows as Record<string, unknown>[]);
 }
 
@@ -97,12 +101,16 @@ export async function getPositionsForMarket(marketSlug: string): Promise<DbPosit
 }
 
 /**
- * Get historical (closed/resolved) positions for a specific buyer.
+ * Get historical (closed/resolved) positions for a specific buyer, optionally filtered by target wallet.
  */
-export async function getHistoricalPositions(buyerAddress: string): Promise<DbPosition[]> {
-  const rows = await getDb()`
-    SELECT * FROM positions WHERE buyer_address = ${buyerAddress} AND status != 'active' ORDER BY closed_at DESC
-  `;
+export async function getHistoricalPositions(buyerAddress: string, targetWallet?: string): Promise<DbPosition[]> {
+  const rows = targetWallet
+    ? await getDb()`
+        SELECT * FROM positions WHERE buyer_address = ${buyerAddress} AND target_wallet = ${targetWallet} AND status != 'active' ORDER BY closed_at DESC
+      `
+    : await getDb()`
+        SELECT * FROM positions WHERE buyer_address = ${buyerAddress} AND status != 'active' ORDER BY closed_at DESC
+      `;
   return normalizePositions(rows as Record<string, unknown>[]);
 }
 

@@ -44,6 +44,25 @@ export function validateHedgeBudget(budget: unknown): ValidationResult {
   return { valid: true };
 }
 
+export function validateAdditionalAddresses(addresses: unknown): ValidationResult {
+  if (addresses === undefined || addresses === null) {
+    return { valid: true }; // optional field
+  }
+  if (!Array.isArray(addresses)) {
+    return { valid: false, error: "additional_addresses must be an array of wallet addresses" };
+  }
+  if (addresses.length > 5) {
+    return { valid: false, error: "additional_addresses supports up to 5 addresses" };
+  }
+  for (const addr of addresses) {
+    const check = validateWalletAddress(addr);
+    if (!check.valid) {
+      return { valid: false, error: `Invalid additional address: ${check.error}` };
+    }
+  }
+  return { valid: true };
+}
+
 export function validateMarketTimeframe(timeframe: unknown): ValidationResult {
   if (timeframe === undefined || timeframe === null) {
     return { valid: true };
@@ -71,6 +90,7 @@ export function validateCloseHedgeReq(req: unknown): ValidationResult {
 export function validateHedgeAnalysisReq(req: Record<string, unknown>): ValidationResult {
   for (const check of [
     validateWalletAddress(req.wallet_address),
+    validateAdditionalAddresses(req.additional_addresses),
     validateChain(req.chain),
     validateRiskTolerance(req.risk_tolerance),
     validateHedgeBudget(req.hedge_budget),
@@ -82,11 +102,14 @@ export function validateHedgeAnalysisReq(req: Record<string, unknown>): Validati
 }
 
 export function validateExecuteHedgeReq(req: Record<string, unknown>): ValidationResult {
+  // Accept either hedge_budget_usdc (canonical) or hedge_budget (backward compat)
+  const budget = req.hedge_budget_usdc ?? req.hedge_budget;
   for (const check of [
     validateWalletAddress(req.wallet_address),
+    validateAdditionalAddresses(req.additional_addresses),
     validateChain(req.chain),
     validateRiskTolerance(req.risk_tolerance),
-    validateHedgeBudget(req.hedge_budget_usdc),
+    validateHedgeBudget(budget),
     validateMarketTimeframe(req.market_timeframe),
   ]) {
     if (!check.valid) return check;

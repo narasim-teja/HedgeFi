@@ -11,6 +11,7 @@ import { fetchMarketBySlug } from "../limitless/client.ts";
 import { jobQueue } from "../acp/handlers.ts";
 import { checkAcpHealth } from "../acp/client.ts";
 import type { DbPosition, ScoredLimitlessMarket, MarketTimeframe } from "../utils/types.ts";
+import { validateWalletAddress } from "../acp/validation.ts";
 
 const log = createLogger("resource-server");
 
@@ -63,11 +64,24 @@ async function handleActivePositions(url: URL): Promise<Response> {
   if (!clientAddress) {
     return errorResponse("Missing required query parameter: clientAddress");
   }
+  const addrCheck = validateWalletAddress(clientAddress);
+  if (!addrCheck.valid) {
+    return errorResponse(addrCheck.error!, 400);
+  }
 
-  const positions = await getActivePositions(clientAddress);
+  const targetWallet = url.searchParams.get("targetWallet") ?? undefined;
+  if (targetWallet) {
+    const twCheck = validateWalletAddress(targetWallet);
+    if (!twCheck.valid) {
+      return errorResponse(twCheck.error!, 400);
+    }
+  }
+
+  const positions = await getActivePositions(clientAddress, targetWallet);
 
   return jsonResponse({
     clientAddress,
+    targetWallet: targetWallet ?? null,
     positions: positions.map(formatActivePosition),
     lastUpdatedAt: new Date().toISOString(),
   });
@@ -126,8 +140,20 @@ async function handleHistoricalPositions(url: URL): Promise<Response> {
   if (!clientAddress) {
     return errorResponse("Missing required query parameter: clientAddress");
   }
+  const histAddrCheck = validateWalletAddress(clientAddress);
+  if (!histAddrCheck.valid) {
+    return errorResponse(histAddrCheck.error!, 400);
+  }
 
-  const positions = await getHistoricalPositions(clientAddress);
+  const targetWallet = url.searchParams.get("targetWallet") ?? undefined;
+  if (targetWallet) {
+    const twCheck = validateWalletAddress(targetWallet);
+    if (!twCheck.valid) {
+      return errorResponse(twCheck.error!, 400);
+    }
+  }
+
+  const positions = await getHistoricalPositions(clientAddress, targetWallet);
 
   return jsonResponse({
     clientAddress,

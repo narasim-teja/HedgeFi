@@ -33,6 +33,7 @@ import {
   recordOrder,
 } from "../../db/positions.ts";
 import { upsertJobState, setConfirmationSent, setDelivered, setFailed } from "../../db/job-state.ts";
+import { getAgentUsdcBalance, getAgentCtBalance } from "../../utils/balance.ts";
 
 const log = createLogger("close-hedge");
 
@@ -295,6 +296,45 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
       return;
     }
 
+    // Market expiry re-check: skip positions expiring within 5 minutes
+    const EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+    const nowMs = Date.now();
+    const expiredPositions: DbPosition[] = [];
+    const viablePositions: DbPosition[] = [];
+
+    for (const pos of positions) {
+      const expiryMs = new Date(pos.expiry).getTime();
+      if (expiryMs <= nowMs + EXPIRY_BUFFER_MS) {
+        jlog.warn(`Position ${pos.id} on ${pos.market_slug} expires in <5 min or already expired, skipping`);
+        expiredPositions.push(pos);
+      } else {
+        viablePositions.push(pos);
+      }
+    }
+
+    if (expiredPositions.length > 0) {
+      jlog.info(`${expiredPositions.length} position(s) expired since preview, ${viablePositions.length} still viable`);
+      for (const pos of expiredPositions) {
+        await updatePositionStatus(pos.id, "expired");
+      }
+    }
+
+    positions = viablePositions;
+
+    if (positions.length === 0) {
+      jlog.info("All positions expired since preview");
+      const deliverable: CloseHedgeDeliverable = {
+        positions_closed: [],
+        total_returned_usdc: 0,
+        return_tx_hash: "all-expired",
+        reasoning: "All hedge positions have expired or are expiring within 5 minutes. No positions were closed.",
+      };
+      await job.deliver(JSON.stringify(deliverable));
+      await setDelivered(String(job.id));
+      try { await job.createNotification("All positions expired — no positions closed."); } catch { /* non-fatal */ }
+      return;
+    }
+
     // Deduplicate positions on the same market/token FOR THE SAME BUYER — sell once per group
     // to avoid "Insufficient conditional token balance" errors from sequential sells.
     // buyer_address is included so positions from different traders are never merged.
@@ -318,7 +358,7 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
 
     for (const [, group] of grouped) {
       const representative = group[0]!;
-      const totalShares = group.reduce((s, p) => s + p.shares, 0);
+      let totalShares = group.reduce((s, p) => s + p.shares, 0);
       const totalCost = group.reduce((s, p) => s + p.total_cost_usdc, 0);
 
       if (totalShares <= 0) {
@@ -332,8 +372,25 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
       try {
         await ensureCtApproval(LIMITLESS_CT_CONTRACT, representative.venue_exchange);
 
+        // Gap #5: Verify on-chain CT balance before selling
+        const ctBalance = await getAgentCtBalance(LIMITLESS_CT_CONTRACT, representative.token_id);
+        if (ctBalance === 0n) {
+          jlog.warn(`Zero CT balance for token ${representative.token_id} on ${representative.market_slug}, skipping group`);
+          for (const pos of group) {
+            await updatePositionStatus(pos.id, "close_failed");
+          }
+          continue;
+        }
+        if (ctBalance < BigInt(totalShares)) {
+          jlog.warn(`CT balance ${ctBalance} < expected ${totalShares} for ${representative.market_slug}, adjusting down`);
+          totalShares = Number(ctBalance);
+        }
+
         const humanShares = totalShares / 1e6;
         jlog.info(`Selling ${humanShares.toFixed(4)} shares on ${representative.market_slug} (${group.length} position(s) merged)`);
+
+        // Gap #7: Snapshot USDC balance before sell for post-sell verification
+        const preSellBalance = await getAgentUsdcBalance();
 
         const result = await placeHedgeOrder({
           marketSlug: representative.market_slug,
@@ -344,8 +401,28 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
           venueExchangeAddress: representative.venue_exchange,
         });
 
+        // Gap #9: Zero-fill guard — skip if sell order wasn't filled
+        if (result.filledSize === 0 && result.totalCost === 0) {
+          jlog.warn(`Zero fill on sell for ${representative.market_slug}, marking close_failed`);
+          for (const pos of group) {
+            await updatePositionStatus(pos.id, "close_failed");
+          }
+          continue;
+        }
+
         const saleAmount = result.totalCost;
         const groupPnl = saleAmount - totalCost;
+
+        // Gap #7: Post-sell USDC verification — warn if on-chain delta doesn't match
+        try {
+          const postSellBalance = await getAgentUsdcBalance();
+          const balanceDelta = postSellBalance - preSellBalance;
+          if (saleAmount > 0 && balanceDelta < saleAmount * 0.90) {
+            jlog.warn(`Post-sell balance mismatch on ${representative.market_slug}: expected ~$${saleAmount.toFixed(2)}, on-chain delta $${balanceDelta.toFixed(2)} (possible settlement delay)`);
+          }
+        } catch (balErr) {
+          jlog.warn("Post-sell balance verification failed (non-blocking)", balErr);
+        }
 
         // Distribute sale proceeds proportionally to each position in the group
         for (const pos of group) {
@@ -436,9 +513,22 @@ export async function handleCloseHedgeExecution(job: AcpJob): Promise<void> {
 
     // Use deliverPayable to atomically deliver result + return funds when there are proceeds
     if (closedPositions.length > 0 && totalReturned > 0) {
-      const fareAmount = new FareAmount(totalReturned, ensureFareChainId(job.baseFare));
+      // Gap #8: Cap return amount to actual available USDC to prevent deliverPayable failure
+      let deliverAmount = totalReturned;
+      try {
+        const agentBalance = await getAgentUsdcBalance();
+        if (agentBalance < totalReturned) {
+          jlog.warn(`Agent USDC balance ($${agentBalance.toFixed(2)}) < totalReturned ($${totalReturned.toFixed(2)}), capping to available`);
+          deliverAmount = Math.floor(agentBalance * 100) / 100; // floor to avoid dust overspend
+          deliverable.total_returned_usdc = deliverAmount;
+        }
+      } catch (balErr) {
+        jlog.warn("Pre-deliverPayable balance check failed, proceeding with computed amount", balErr);
+      }
+
+      const fareAmount = new FareAmount(deliverAmount, ensureFareChainId(job.baseFare));
       await job.deliverPayable(JSON.stringify(deliverable), fareAmount);
-      jlog.info(`Delivered with fund return ($${totalReturned.toFixed(2)})`);
+      jlog.info(`Delivered with fund return ($${deliverAmount.toFixed(2)})`);
     } else {
       await job.deliver(JSON.stringify(deliverable));
       jlog.info("Delivered (no funds to return)");

@@ -1,9 +1,9 @@
 import type { AcpJob } from "@virtuals-protocol/acp-node";
 import { Fare, FareAmount } from "@virtuals-protocol/acp-node";
-import { createPublicClient, http } from "viem";
-import { base } from "viem/chains";
 import { createLogger } from "../../utils/logger.ts";
-import { STABLECOIN_SYMBOLS, USDC_BASE, ERC20_ABI, CHAIN_CONFIG, BASE_CHAIN_ID, MAX_HEDGE_BUDGET_USD, MIN_ETH_FOR_GAS } from "../../utils/constants.ts";
+import { STABLECOIN_SYMBOLS, BASE_CHAIN_ID, MAX_HEDGE_BUDGET_USD, MIN_ETH_FOR_GAS } from "../../utils/constants.ts";
+import { getAgentUsdcBalance, getAgentEthBalance } from "../../utils/balance.ts";
+import { tryReserve, releaseReservation } from "../../utils/balance-reservation.ts";
 
 /**
  * Ensure the Fare object has chainId set (required by deliverPayable).
@@ -47,45 +47,6 @@ const REDISTRIBUTION_THRESHOLD_USD = 0.10;
 const MAX_REDISTRIBUTION_ROUNDS = 2;
 
 // =============================================
-// Agent wallet USDC balance check
-// =============================================
-
-async function getAgentUsdcBalance(): Promise<number> {
-  const walletAddress = process.env.HEDGEFI_WALLET_ADDRESS;
-  if (!walletAddress) return 0;
-
-  const client = createPublicClient({
-    chain: base,
-    transport: http(CHAIN_CONFIG.base.rpcUrl),
-  });
-
-  const raw = await client.readContract({
-    address: USDC_BASE,
-    abi: ERC20_ABI,
-    functionName: "balanceOf",
-    args: [walletAddress as `0x${string}`],
-  });
-
-  return Number(raw) / 1e6; // USDC has 6 decimals
-}
-
-async function getAgentEthBalance(): Promise<number> {
-  const walletAddress = process.env.HEDGEFI_WALLET_ADDRESS;
-  if (!walletAddress) return 0;
-
-  const client = createPublicClient({
-    chain: base,
-    transport: http(CHAIN_CONFIG.base.rpcUrl),
-  });
-
-  const raw = await client.getBalance({
-    address: walletAddress as `0x${string}`,
-  });
-
-  return Number(raw) / 1e18; // ETH has 18 decimals
-}
-
-// =============================================
 // Helpers
 // =============================================
 
@@ -98,11 +59,21 @@ function parseRequirement(job: AcpJob): ExecuteHedgeRequirement {
     hedge_budget_usdc: 50,
   };
 
+  let parsed: ExecuteHedgeRequirement;
   if (typeof raw === "string") {
-    try { return JSON.parse(raw); } catch { return fallback; }
+    try { parsed = JSON.parse(raw); } catch { return fallback; }
+  } else if (raw && typeof raw === "object") {
+    parsed = raw as ExecuteHedgeRequirement;
+  } else {
+    return fallback;
   }
-  if (raw && typeof raw === "object") return raw as ExecuteHedgeRequirement;
-  return fallback;
+
+  // Normalize hedge_budget -> hedge_budget_usdc for backward compat
+  if (!parsed.hedge_budget_usdc && (parsed as unknown as Record<string, unknown>).hedge_budget) {
+    parsed.hedge_budget_usdc = Number((parsed as unknown as Record<string, unknown>).hedge_budget);
+  }
+
+  return parsed;
 }
 
 function formatExecutionNotification(
@@ -255,16 +226,19 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
     };
   }
 
-  // Pre-flight agent liquidity check — reject BEFORE accept() so buyer never pays
+  // Pre-flight agent liquidity check with reservation — reject BEFORE accept() so buyer never pays.
+  // The reservation system prevents cross-buyer race conditions: if multiple buyers submit
+  // jobs simultaneously, each reservation checks against (balance - alreadyReserved).
   try {
     const agentBalance = await getAgentUsdcBalance();
     jlog.info(`Pre-flight agent USDC balance: $${agentBalance.toFixed(2)}, requested budget: $${req.hedge_budget_usdc}`);
-    if (agentBalance < req.hedge_budget_usdc) {
-      jlog.warn(`Agent liquidity insufficient ($${agentBalance.toFixed(2)}) for budget ($${req.hedge_budget_usdc})`);
+    const reserved = tryReserve(String(job.id), job.clientAddress ?? "unknown", req.hedge_budget_usdc, agentBalance);
+    if (!reserved) {
+      jlog.warn(`Agent liquidity insufficient after reservations for budget ($${req.hedge_budget_usdc})`);
       await setFailed(String(job.id));
       return {
         type: "error",
-        message: `Agent liquidity insufficient ($${agentBalance.toFixed(2)} available) for budget ($${req.hedge_budget_usdc}). Try again later or reduce budget.`,
+        message: `Agent liquidity insufficient for budget ($${req.hedge_budget_usdc}). Funds may be committed to other in-flight jobs. Try again later or reduce budget.`,
       };
     }
   } catch (balErr) {
@@ -283,6 +257,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
     jlog.info(`Pre-flight agent ETH balance: ${ethBalance.toFixed(6)} ETH`);
     if (ethBalance < MIN_ETH_FOR_GAS) {
       jlog.warn(`Agent ETH balance too low for gas (${ethBalance.toFixed(6)} ETH < ${MIN_ETH_FOR_GAS})`);
+      releaseReservation(String(job.id));
       await setFailed(String(job.id));
       return {
         type: "error",
@@ -297,9 +272,23 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
   const timeframe = req.market_timeframe ?? "all";
 
   try {
-    // Step 1: Read real wallet exposure
+    // Step 1: Read real wallet exposure (primary + additional addresses)
     const tWallet = jlog.time("Read wallet balances");
     const rawBalances = await readWalletBalances(req.wallet_address, req.chain);
+
+    // Merge additional wallet addresses if provided
+    if (req.additional_addresses && req.additional_addresses.length > 0) {
+      for (const addr of req.additional_addresses) {
+        try {
+          const additionalBalances = await readWalletBalances(addr, req.chain);
+          rawBalances.push(...additionalBalances);
+          jlog.info(`Merged balances from additional address ${addr.slice(0, 10)}...`);
+        } catch (err) {
+          jlog.warn(`Failed to read additional wallet ${addr}`, err);
+        }
+      }
+    }
+
     const coingeckoIds = rawBalances.map((b) => b.coingeckoId);
     const prices = await getTokenPrices(coingeckoIds);
     const exposure = analyzeExposure(rawBalances, prices);
@@ -308,6 +297,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
     // Edge case: stablecoin-only portfolio
     if (isStablecoinOnly(exposure)) {
       jlog.info("Portfolio is stablecoin-only, cannot hedge");
+      releaseReservation(String(job.id));
       await setFailed(String(job.id));
       const reasoning = generateEdgeCaseMessage("stablecoins_only", { totalValue: exposure.total_value_usd });
       return { type: "error", message: reasoning };
@@ -326,6 +316,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
     // Edge case: no markets available
     if (scoredMarkets.length === 0) {
       jlog.info("No hedging markets found");
+      releaseReservation(String(job.id));
       await setFailed(String(job.id));
       const topNonStable = exposure.tokens.find((t) => !STABLECOIN_SYMBOLS.has(t.symbol));
       const timeframeNote = timeframe !== "all"
@@ -346,6 +337,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
 
     if (recommendations.length === 0) {
       jlog.info("No viable recommendations after sizing");
+      releaseReservation(String(job.id));
       await setFailed(String(job.id));
       return { type: "error", message: "No viable hedge positions could be constructed within your budget and risk parameters." };
     }
@@ -393,6 +385,7 @@ export async function handleExecuteHedgeAnalysis(job: AcpJob): Promise<AnalysisR
 
   } catch (err) {
     jlog.error("Failed during hedge analysis phase", err);
+    releaseReservation(String(job.id));
     await setFailed(String(job.id));
     return {
       type: "error",
@@ -416,6 +409,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
   const state = await getJobState(String(job.id));
   if (!state?.confirmation_payload) {
     jlog.error("No confirmation payload found for confirmed job");
+    releaseReservation(String(job.id));
     await rejectWithRefund(job, jlog, "Internal error: hedge plan not found. Please retry.", req.hedge_budget_usdc);
     return;
   }
@@ -425,6 +419,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
     plan = JSON.parse(state.confirmation_payload);
   } catch {
     jlog.error("Failed to parse stored confirmation payload");
+    releaseReservation(String(job.id));
     await rejectWithRefund(job, jlog, "Internal error: corrupted hedge plan. Please retry.", req.hedge_budget_usdc);
     return;
   }
@@ -441,6 +436,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
 
   if (viableMarkets.length === 0) {
     jlog.warn("All recommended markets expired since Phase A plan was created");
+    releaseReservation(String(job.id));
     await rejectWithRefund(job, jlog,
       "All recommended markets expired since your plan was created. Full refund issued. Please submit a new request.",
       req.hedge_budget_usdc);
@@ -453,15 +449,20 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
   }
 
   try {
-    // Pre-check: verify agent wallet has enough USDC to cover the budget
+    // Pre-check: verify agent trading wallet has enough USDC (reservation-aware)
+    let preTradeBalance: number;
     try {
-      const agentBalance = await getAgentUsdcBalance();
-      jlog.info(`Agent USDC balance: $${agentBalance.toFixed(2)}, budget: $${req.hedge_budget_usdc}`);
-      if (agentBalance < req.hedge_budget_usdc) {
-        jlog.warn(`Insufficient agent balance ($${agentBalance.toFixed(2)}) for budget ($${req.hedge_budget_usdc})`);
+      preTradeBalance = await getAgentUsdcBalance();
+      jlog.info(`Agent USDC balance: $${preTradeBalance.toFixed(2)}, budget: $${req.hedge_budget_usdc}`);
+
+      // Re-verify reservation against fresh balance
+      const reserved = tryReserve(String(job.id), job.clientAddress ?? "unknown", req.hedge_budget_usdc, preTradeBalance);
+      if (!reserved) {
+        jlog.warn(`Insufficient agent balance after reservations for budget ($${req.hedge_budget_usdc})`);
+        releaseReservation(String(job.id));
         await rejectWithRefund(
           job, jlog,
-          `Insufficient agent liquidity ($${agentBalance.toFixed(2)} available) for requested budget ($${req.hedge_budget_usdc}). Please try again later or reduce budget.`,
+          `Insufficient agent liquidity for requested budget ($${req.hedge_budget_usdc}). Funds may be committed to other in-flight jobs. Please try again later.`,
           req.hedge_budget_usdc
         );
         await setFailed(String(job.id));
@@ -469,6 +470,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
       }
     } catch (balErr) {
       jlog.error("Failed to check agent balance in Phase B", balErr);
+      releaseReservation(String(job.id));
       await rejectWithRefund(job, jlog,
         "Unable to verify agent liquidity. Full refund issued. Please try again.",
         req.hedge_budget_usdc);
@@ -547,11 +549,18 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
           ...(useGtc ? { pricePerShare: hedgePrice, expirationTimestamp } : {}),
         });
 
+        // Zero-fill guard: skip position creation if order didn't fill
+        if (result.filledSize === 0 && result.totalCost === 0) {
+          jlog.warn(`Zero fill for market ${marketSlug} — order placed but no shares acquired, skipping`);
+          continue;
+        }
+
         // Record in database
         const buyerAddress = job.clientAddress ?? "unknown";
         const positionId = await createPosition({
           jobId: String(job.id),
           buyerAddress,
+          targetWallet: req.wallet_address,
           marketSlug,
           marketTitle: rec.market_question,
           tokenId,
@@ -648,11 +657,12 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
           venueExchangeAddress: venueExchange,
         });
 
-        if (result.totalCost > 0) {
+        if (result.totalCost > 0 && result.filledSize > 0) {
           const buyerAddress = job.clientAddress ?? "unknown";
           const positionId = await createPosition({
             jobId: String(job.id),
             buyerAddress,
+            targetWallet: req.wallet_address,
             marketSlug: retrySlug,
             marketTitle: matchingRec.market_question,
             tokenId,
@@ -707,9 +717,23 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
 
     tOrders.end();
 
+    // Post-execution balance reconciliation (audit trail)
+    try {
+      const postTradeBalance = await getAgentUsdcBalance();
+      const expectedBalance = preTradeBalance - totalSpent;
+      const reconDelta = Math.abs(postTradeBalance - expectedBalance);
+      jlog.info(`Post-execution reconciliation: preBalance=$${preTradeBalance.toFixed(2)}, postBalance=$${postTradeBalance.toFixed(2)}, totalSpent=$${totalSpent.toFixed(2)}, delta=$${reconDelta.toFixed(2)}`);
+      if (reconDelta > 0.50) {
+        jlog.warn(`Balance reconciliation mismatch: expected ~$${expectedBalance.toFixed(2)}, actual $${postTradeBalance.toFixed(2)} (delta $${reconDelta.toFixed(2)})`);
+      }
+    } catch (reconErr) {
+      jlog.warn("Post-execution reconciliation check failed (non-blocking)", reconErr);
+    }
+
     // If all orders failed but we had recommendations, refund
     if (hedges_placed.length === 0 && recommendations.length > 0) {
       jlog.warn(`All ${recommendations.length} orders failed to fill`);
+      releaseReservation(String(job.id));
       await setFailed(String(job.id));
       await rejectWithRefund(
         job, jlog,
@@ -780,6 +804,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
       jlog.info("Delivered (full budget deployed)");
     }
     await setDelivered(String(job.id));
+    releaseReservation(String(job.id));
 
     // Notification memo
     try {
@@ -791,6 +816,7 @@ export async function handleExecuteHedgeExecution(job: AcpJob): Promise<void> {
     }
   } catch (err) {
     jlog.error("Failed during hedge execution phase", err);
+    releaseReservation(String(job.id));
     await setFailed(String(job.id));
 
     try {
